@@ -22,7 +22,9 @@ size_t BufferPool::FindInvalid() const noexcept {
 size_t BufferPool::SweepVictim() {
     // Each unpinned frame can be decremented at most five times before selection.
     for (size_t inspected = 0; inspected < 6 * frames_.size(); ++inspected) {
-        const size_t index = sweep_.Next(frames_.size());
+        const size_t index = clock_hand_;
+        ++clock_hand_;
+        if (clock_hand_ == frames_.size()) clock_hand_ = 0;
         Frame& frame = frames_[index];
         ++metrics_.sweep_inspections;
         if (!frame.valid) return index;

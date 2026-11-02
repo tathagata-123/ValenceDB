@@ -138,9 +138,17 @@ right: children C2 C3 C4    separators S2 S3
 
 S1 belongs only in the parent. Production uses the same rule: left C0..C101 with S0..S100, promote S101, right C102..C204 with S102..S203. Tests check the promoted separator is absent from both split children.
 
+Internal split propagation uses the same `ReadInternal(page)` helper as deletion.
+It fetches, validates, and returns owned `children` and `separators` vectors with
+one spare child slot. Insertion no longer contains a second internal decoder or
+manages a parent page guard itself. The fetch count is unchanged. Split writes
+use spans over these vectors, avoiding separate left/right copies. The ordinary
+leaf insertion path still writes through its existing guard, and lookup/descent
+still binary search directly in pages.
+
 ## Pins, failures, and persistence
 
-This implementation uses at most **one tree-owned page guard at a time**, including reservation and metadata handling. Each page is decoded to bounded owned scratch before another is fetched. The ancestor path and reservations contain only IDs/counts. Tests force eviction with 1–3 frames and verify active pins return to zero after successful and expected-error operations. Multi-level reservations do not accumulate pins.
+This implementation uses at most **one tree-owned page guard at a time**, including reservation and metadata handling. Structural mutations decode pages to bounded owned scratch before fetching another page. Search and cursor paths read guarded page fields directly without node vectors. The ancestor path and reservations contain only IDs/counts. Tests force eviction with 1–3 frames and verify active pins return to zero after successful and expected-error operations. Multi-level reservations do not accumulate pins.
 
 Preallocation prevents a predictable split-page allocation failure after existing nodes have already changed. It is not transactionality or crash atomicity. Allocation is append-only; unused reserved pages can remain unreachable and are not reclaimed. The focused failure test injects a dirty-eviction write error inside NewPage during reservation, proves existing tree bytes/contents/epoch remain unchanged, and successfully retries. It uses the existing storage/buffer failure hook without adding a separate fault framework.
 
@@ -197,7 +205,17 @@ Right rotation is symmetric. For current `[A]`, parent fence 29, and right child
 
 For adjacent internals, the survivor receives `left.children + right.children` and `left.separators + parent_fence + right.separators`. The parent fence becomes a separator inside the survivor; then the parent loses the right child and that fence.
 
-`Erase` iterates up the saved path. `RepairLeaf` handles the first level; `RepairInternal` handles later ones. A parent at valid occupancy is written and propagation stops. An underfull parent remains in bounded owned scratch and becomes current at the next ancestor. Borrow restores occupancy and stops propagation after its parent is written. The implementation keeps one decoded parent/current/sibling set, O(height) IDs, and **at most one PageGuard** at a time; sibling checks release their guards before fetching another page. This also works with a one-frame pool.
+`Erase` calls `RepairLeaf` once, then iterates up the saved path carrying only an internal node. `RepairInternal` handles each later underflow; no leaf/internal mode flag is needed. A parent at valid occupancy is written and propagation stops. An underfull parent remains in bounded owned scratch and becomes current at the next ancestor. Borrow restores occupancy and stops propagation after its parent is written. The implementation keeps one decoded parent/current set and at most two sibling values, O(height) IDs, and **at most one PageGuard** at a time; sibling checks release their guards before fetching another page. This also works with a one-frame pool.
+
+A left sibling that cannot lend remains in owned scratch while the right sibling is
+checked. If neither lends, the merge reuses that decoded left value. With no left
+sibling, the right value is merged in its existing scope. Each sibling is read and decoded
+at most once for the repair decision; writes still fetch their destinations.
+There are no overlapping page guards. This trades
+at most one additional bounded sibling vector set for avoiding a second fetch,
+validation, and decoding. ReadLeaf reserves its known count; deletion frees a slot before borrowing.
+ReadInternal also leaves room for one added child. Both avoid repeated vector
+growth during decoding.
 
 ### Root contraction and the empty tree
 

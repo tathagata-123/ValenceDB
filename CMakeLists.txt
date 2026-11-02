@@ -19,7 +19,6 @@ add_library(valencedb STATIC
     src/storage/database.cpp
     src/buffer/buffer_pool.cpp
     src/buffer/page_guard.cpp
-    src/buffer/clock_sweep.cpp
     src/buffer/scan_ring.cpp
     src/index/bplus_page.cpp
     src/index/bplus_tree.cpp

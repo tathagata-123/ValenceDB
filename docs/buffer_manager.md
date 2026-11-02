@@ -10,7 +10,7 @@ A normal cache hit increments usage up to 5, even when another guard already pin
 
 ## Counted CLOCK sweep
 
-The hand identifies the **next frame to inspect**. Each inspection advances it once, wrapping at the pool size. An invalid frame is consumed before evicting any valid page. Otherwise, the sweep follows:
+`BufferPool` owns a single `size_t clock_hand_`, identifying the **next frame to inspect**. `SweepVictim()` advances it directly; there is no separate CLOCK state wrapper. Each inspection advances it once, wrapping at the pool size. An invalid frame is consumed before evicting any valid page. Otherwise, the sweep follows:
 
 ```text
 for at most 6 * frame_count inspections:

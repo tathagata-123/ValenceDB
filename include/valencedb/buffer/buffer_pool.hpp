@@ -1,6 +1,5 @@
 #pragma once
 
-#include "valencedb/buffer/clock_sweep.hpp"
 #include "valencedb/buffer/page_guard.hpp"
 #include "valencedb/buffer/scan_ring.hpp"
 #include "valencedb/storage/disk_manager.hpp"
@@ -56,7 +55,7 @@ public:
     void DiscardTemporaryPages();
 
     size_t FrameCount() const noexcept { return frames_.size(); }
-    size_t SweepHand() const noexcept { return sweep_.hand(); }
+    size_t SweepHand() const noexcept { return clock_hand_; }
     const BufferMetrics& metrics() const noexcept { return metrics_; }
     std::vector<FrameSnapshot> InspectFrames() const;
 
@@ -75,7 +74,7 @@ private:
     DiskManager& disk_;
     std::vector<Frame> frames_;
     std::unordered_map<PageRef, size_t, PageRefHash> page_table_;
-    ClockSweep sweep_;
+    size_t clock_hand_ = 0;  // Next frame to inspect.
     BufferMetrics metrics_;
 
     size_t FindInvalid() const noexcept;
