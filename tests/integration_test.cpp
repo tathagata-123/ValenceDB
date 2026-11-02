@@ -386,20 +386,19 @@ void TempMetricsAndReset() {
     db.CreateTable("empty", LeftSchema());
     const auto schema = LeftSchema();
     QueryContext q(db, {32768, 2});
-    TempRelation a(q.Temps(), schema);
+    TempWriter wa(q.Temps(), schema);
     VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 0);
-    { TempWriter w(a); w.Append(Tuple({Value(int64_t{1}), Value(int64_t{2}), Value(std::string())})); w.Seal(); }
+    wa.Append(Tuple({Value(int64_t{1}), Value(int64_t{2}), Value(std::string())})); auto a = wa.Finish();
     const auto fetches = db.Metrics().buffer_fetches;
     { TempReader r(a); Tuple row({}); VDB_CHECK(r.Next(row)); VDB_CHECK(!r.Next(row)); }
     VDB_CHECK(db.Metrics().buffer_fetches == fetches + 1); // One staged read, including EOF.
-    a.Release();
+    { auto copy = a; VDB_CHECK(copy.RowCount() == 1); }
     VDB_CHECK(db.Metrics().buffer_fetches == fetches + 1); // No release traversal.
     VDB_CHECK(q.Temps().Metrics().current_temp_extent_pages == 1);
-    TempRelation b(q.Temps(), schema);
-    { TempWriter w(b); w.Append(Tuple({Value(int64_t{3}), Value(int64_t{4}), Value(std::string())})); w.Seal(); }
+    TempWriter wb(q.Temps(), schema);
+    wb.Append(Tuple({Value(int64_t{3}), Value(int64_t{4}), Value(std::string())})); auto b = wb.Finish();
     VDB_CHECK(b.FirstPage() == 1);
-    TempRelation c(q.Temps(), schema);
-    { TempWriter w(c); Throws([&] { w.Append(Tuple({Value(int64_t{5}), Value(int64_t{6}), Value(std::string())})); }, "cap"); }
+    { TempWriter w(q.Temps(), schema); Throws([&] { w.Append(Tuple({Value(int64_t{5}), Value(int64_t{6}), Value(std::string())})); }, "cap"); }
     SeqScan root(q, {"empty"}); root.Init(); Tuple row({}); VDB_CHECK(!root.Next(row));
     db.Disk().FailNextIo(FailNext::ResetTemporary);
     Throws([&] { q.FinishQuery(root); }, "reset");

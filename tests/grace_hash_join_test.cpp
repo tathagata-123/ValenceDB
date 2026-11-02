@@ -189,16 +189,15 @@ void AuditPartitions(GraceHashJoin& join, const std::vector<Tuple>& left, const 
         size_t total = 0;
         const Schema* schema = nullptr;
         for (size_t i = 0; i < parts.size(); ++i) {
-            const auto& part = *parts[i];
+            const auto& part = parts[i];
             if (schema) VDB_CHECK(schema == &part.OutputSchema()); // One immutable schema, borrowed.
             schema = &part.OutputSchema();
-            VDB_CHECK(part.Sealed());
             VDB_CHECK(part.ModeledRowBytes() == part.RowCount() * RowMemoryCharge(*schema));
             if (!part.RowCount()) VDB_CHECK(part.PageCount() == 0 && part.FirstPage() == kInvalidPageId);
             const auto& m = join.Metrics().pairs[i];
             VDB_CHECK(part.RowCount() == (is_left ? m.left_rows : m.right_rows));
             VDB_CHECK(part.PageCount() == (is_left ? m.left_pages : m.right_pages));
-            TempReader reader(*parts[i]);
+            TempReader reader(parts[i]);
             Tuple row({});
             while (reader.Next(row)) {
                 VDB_CHECK(GraceHashJoin::PartitionHash(row.value(is_left ? lk : rk).as_int64()) % parts.size() == i);
@@ -326,10 +325,10 @@ void BoundariesAndSkew() {
     GraceHashJoin model(q, {0, 0, 20000}, Child(q, Narrow(), empty, a), Child(q, Narrow(), empty, b));
     const auto memory = model.Memory();
     VDB_CHECK(memory.left_row_bytes == 168 && memory.right_row_bytes == 168);
-    VDB_CHECK(memory.scratch_bytes == 10008 && memory.partition_count == 2 && memory.descriptor_bytes == 256);
+    VDB_CHECK(memory.scratch_bytes == 10008 && memory.partition_count == 2 && memory.descriptor_bytes == 384);
     VDB_CHECK(memory.left_build_capacity == 36 && memory.right_build_capacity == 36);
-    VDB_CHECK(memory.fallback_memory == 19744 && memory.left_block_capacity == 57);
-    std::cout << "model: M=20000 S=10008 p=2 Dghj=256 Tleft=Tright=168 capacity=36/36 fallback=19744 Cblock=57\n";
+    VDB_CHECK(memory.fallback_memory == 19616 && memory.left_block_capacity == 57);
+    std::cout << "model: M=20000 S=10008 p=2 Dghj=384 Tleft=Tright=168 capacity=36/36 fallback=19616 Cblock=57\n";
     q.Close();
     for (size_t n : {size_t{35}, size_t{36}, size_t{37}}) {
         const auto m = Run(Narrow(), Narrow(), Rows(n, 7), Rows(n + 1, 7), 0, 0);
@@ -358,7 +357,7 @@ void FallbackRightAndStandalone() {
     QueryContext q(db);
     SourceState a, b; a.allowed = 100;
     BlockNestedLoopJoin bnlj(q, {1, 0, PhysicalOuter::Right}, Child(q, Wide(), left, a),
-                            Child(q, Narrow(), right, b), 22000 - 256);
+                            Child(q, Narrow(), right, b), 22000 - 384);
     bnlj.Init();
     const auto actual = Drain(db, bnlj);
     VDB_CHECK(Canonical(bnlj.OutputSchema(), actual) == Reference(bnlj.OutputSchema(), left, right, 1, 0));
@@ -393,8 +392,8 @@ void ManyPartitionsAndMixedPairs() {
         left.insert(left.end(), l.begin(), l.end());
         right.insert(right.end(), r.begin(), r.end());
     }
-    // Narrow/Narrow S=10008: M=62000 gives p=12 > F=8.
-    m = Run(Narrow(), Narrow(), left, right, 0, 0, 62000);
+    // Narrow/Narrow S=10008: M=63000 gives p=12 > F=8.
+    m = Run(Narrow(), Narrow(), left, right, 0, 0, 63000);
     VDB_CHECK(m.pairs.size() == 12 && m.hash_pairs == 12 && m.peak_partition_writers == 12);
     VDB_CHECK(m.left_build_pairs > 0 && m.right_build_pairs > 0 && m.peak_build_rows == 7);
     std::cout << "F=8 p=12: hash_pairs=12 peak_build_rows=7 partition_pages=" << m.partition_write_pages
@@ -403,7 +402,7 @@ void ManyPartitionsAndMixedPairs() {
     const auto large_left = Rows(90, KeyFor(1, 3)), large_right = Rows(95, KeyFor(1, 3));
     left.insert(left.end(), large_left.begin(), large_left.end());
     right.insert(right.end(), large_right.begin(), large_right.end());
-    m = Run(Narrow(), Narrow(), left, right, 0, 0, 23000);
+    m = Run(Narrow(), Narrow(), left, right, 0, 0, 23300);
     VDB_CHECK(m.pairs.size() == 3 && m.hash_pairs == 1 && m.fallback_pairs == 1 && m.empty_pairs == 1);
     VDB_CHECK(m.peak_build_rows == 2 && m.output_rows == 8556);
     std::cout << "mixed p=3: hash=1 fallback=1 empty=1 output=8556\n";
@@ -474,7 +473,7 @@ void InvalidConfiguration() {
         Schema bad(SchemaKind::Intermediate, {{"bad", type, uint16_t(type == TypeId::Varchar ? 20 : 0), type == TypeId::Int64}});
         invalid(bad, Narrow(), 0, 0, 20000); invalid(Narrow(), bad, 0, 0, 20000);
     }
-    for (size_t bytes : {size_t{0}, size_t{1}, size_t{10007}, size_t{10008}, size_t{10009}, size_t{18455}})
+    for (size_t bytes : {size_t{0}, size_t{1}, size_t{10007}, size_t{10008}, size_t{10009}, size_t{18455}, size_t{18839}})
         invalid(Narrow(), Narrow(), 0, 0, bytes);
     GraceHashJoin enormous(q, {0, 0, std::numeric_limits<size_t>::max()},
         Child(q, Narrow(), rows, a), Child(q, Narrow(), rows, b));
@@ -491,9 +490,9 @@ void InvalidConfiguration() {
     Throws([&] { GraceHashJoin join(q, {0, 0}, Child(foreign, Narrow(), rows, a), Child(q, Narrow(), rows, b)); });
     GraceHashJoin defaulted(q, {0, 0}, Child(q, Narrow(), rows, a), Child(q, Narrow(), rows, b));
     VDB_CHECK(defaulted.Memory().max_bytes == 20000);
-    GraceHashJoin minimum(q, {0, 0, 18456}, Child(q, Narrow(), rows, a), Child(q, Narrow(), rows, b));
+    GraceHashJoin minimum(q, {0, 0, 18840}, Child(q, Narrow(), rows, a), Child(q, Narrow(), rows, b));
     VDB_CHECK(minimum.Memory().partition_count == 2);
-    VDB_CHECK(minimum.Memory().fallback_memory - minimum.Memory().scratch_bytes == 8192);
+    VDB_CHECK(minimum.Memory().fallback_memory - minimum.Memory().scratch_bytes == 8448);
     VDB_CHECK(minimum.Memory().left_block_capacity >= 1 && minimum.Memory().right_block_capacity >= 1);
     VDB_CHECK(a.inits == 0 && b.inits == 0);
     q.Close(); foreign.Close();
@@ -514,14 +513,14 @@ void MaximumSchema() {
     values.emplace_back(std::string(214, 'y'));
     for (size_t i = 0; i < 3; ++i) values.emplace_back(int64_t(i));
     const std::vector<Tuple> rows{Tuple(values)};
-    // Maximum legal output T=4672, S=23232. p=2 minimum still leaves 8192 for a block.
-    const auto m = Run(schema, schema, rows, rows, 0, 0, 23232 + 2 * 4224);
+    // Maximum legal output T=4672, S=23232. p=2 minimum still leaves 8448 for a block.
+    const auto m = Run(schema, schema, rows, rows, 0, 0, 23232 + 2 * 4416);
     VDB_CHECK(m.hash_pairs == 1 && m.output_rows == 1);
     Schema payload(SchemaKind::Intermediate, {{"key", TypeId::Int64}, {"double", TypeId::Double, 0, true},
                                              {"text", TypeId::Varchar, 8, true}});
     const std::vector<Tuple> special{Tuple({Value(int64_t{7}), Value::Null(TypeId::Double), Value::Null(TypeId::Varchar)}),
                                     Tuple({Value(int64_t{7}), Value(2.5), Value(std::string("\0", 1))})};
-    VDB_CHECK(Run(payload, Narrow(), special, Rows(3, 7), 0, 0, 23000).output_rows == 6);
+    VDB_CHECK(Run(payload, Narrow(), special, Rows(3, 7), 0, 0, 23300).output_rows == 6);
 }
 void TempLimits() {
     for (size_t cap : {size_t{1}, size_t{3}}) {

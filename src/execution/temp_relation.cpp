@@ -31,97 +31,86 @@ void TempStore::Reset() {
     metrics_.current_temp_extent_pages = 0;
     active_ = false;
 }
-TempRelation::TempRelation(TempStore& store, const Schema& schema)
-    : store_(store), schema_(schema) {
-    store_.CheckActive();
-    ++store_.metrics_.temp_relations_created;
-}
-void TempRelation::CheckLive() const {
-    store_.CheckActive();
-    if (released_) throw DbError("temporary relation is released");
-}
-void TempRelation::Release() {
-    if (open_handles_ != 0) throw DbError("close relation handles before release");
-    released_ = true;
-    first_ = last_ = kInvalidPageId;
-    rows_ = pages_ = modeled_bytes_ = 0;
-}
-TempWriter::TempWriter(TempRelation& relation) : relation_(&relation) {
-    relation.CheckLive();
-    if (relation.writer_started_) throw DbError("temporary relation permits one writer");
-    relation.writer_started_ = true;
-    ++relation.open_handles_;
-    ++relation.store_.open_handles_;
+TempWriter::TempWriter(TempStore& store, const Schema& schema)
+    : store_(&store), schema_(schema) {
+    store.CheckActive();
+    ++store.open_handles_;
+    ++store.metrics_.temp_relations_created; // Counts construction attempts, as before.
 }
 void TempWriter::Publish() {
-    auto& relation = *relation_;
-    auto guard = relation.store_.db_.Buffer().Fetch({FileKind::Temporary, relation.last_});
+    auto guard = store_->db_.Buffer().Fetch({FileKind::Temporary, last_});
     guard.MutableData() = staging_;
     guard.MarkDirty();
 }
 void TempWriter::Append(const Tuple& tuple) {
-    if (!relation_) throw DbError("temporary writer is closed");
-    auto& relation = *relation_;
-    relation.CheckLive();
-    const auto bytes = EncodeTuple(relation.schema_, tuple);
-    const size_t rows = CheckedAdd(relation.rows_, 1);
-    const size_t modeled = CheckedAdd(relation.modeled_bytes_, RowMemoryCharge(relation.schema_));
-    if (relation.last_ == kInvalidPageId || !SlottedPage::CanFit(staging_, bytes.size())) {
-        const PageId next = relation.store_.Allocate();
-        if (relation.last_ != kInvalidPageId) {
-            SlottedPage::SetNext(staging_, next);
-            Publish();
-        } else {
-            relation.first_ = next;
+    if (!store_) throw DbError("temporary writer is closed");
+    try {
+        store_->CheckActive();
+        const auto bytes = EncodeTuple(schema_, tuple);
+        const size_t rows = CheckedAdd(rows_, 1);
+        const size_t modeled = CheckedAdd(modeled_bytes_, RowMemoryCharge(schema_));
+        if (last_ == kInvalidPageId || !SlottedPage::CanFit(staging_, bytes.size())) {
+            const PageId next = store_->Allocate();
+            if (last_ != kInvalidPageId) {
+                SlottedPage::SetNext(staging_, next);
+                Publish();
+            } else {
+                first_ = next;
+            }
+            SlottedPage::Initialize(staging_, next, kInvalidPageId);
+            last_ = next;
+            ++pages_;
         }
-        SlottedPage::Initialize(staging_, next, kInvalidPageId);
-        relation.last_ = next;
-        ++relation.pages_;
+        if (!SlottedPage::Insert(staging_, bytes)) throw DbError("temporary tuple does not fit page");
+        rows_ = rows;
+        modeled_bytes_ = modeled;
+    } catch (...) {
+        Close(); // A failed append can never be turned into a successful partial run.
+        throw;
     }
-    if (!SlottedPage::Insert(staging_, bytes)) throw DbError("temporary tuple does not fit page");
-    relation.rows_ = rows;
-    relation.modeled_bytes_ = modeled;
 }
-void TempWriter::Seal() {
-    if (!relation_) throw DbError("temporary writer is closed");
-    relation_->CheckLive();
-    if (relation_->last_ != kInvalidPageId) {
-        SlottedPage::SetNext(staging_, kInvalidPageId);
-        Publish();
+TempRun TempWriter::Finish() {
+    if (!store_) throw DbError("temporary writer is closed");
+    try {
+        store_->CheckActive();
+        if (last_ != kInvalidPageId) {
+            SlottedPage::SetNext(staging_, kInvalidPageId);
+            Publish();
+        }
+        TempRun run(*store_, schema_, first_, last_, rows_, pages_, modeled_bytes_);
+        Close();
+        return run;
+    } catch (...) {
+        Close();
+        throw;
     }
-    relation_->sealed_ = true;
-    Close();
 }
 void TempWriter::Close() noexcept {
-    if (!relation_) return;
-    --relation_->open_handles_;
-    --relation_->store_.open_handles_;
-    relation_ = nullptr;
+    if (!store_) return;
+    --store_->open_handles_;
+    store_ = nullptr;
 }
-TempReader::TempReader(TempRelation& relation) : relation_(&relation) {
-    relation.CheckLive();
-    if (!relation.sealed_) throw DbError("temporary reader requires a sealed relation");
-    ++relation.open_handles_;
-    ++relation.store_.open_handles_;
-    Rewind();
+TempReader::TempReader(const TempRun& run) : run_(run) {
+    Rewind(); // Validate before registering: a failed constructor owns no handle.
+    ++run_.store_->open_handles_;
 }
 void TempReader::Rewind() {
-    if (!relation_) throw DbError("temporary reader is closed");
-    relation_->CheckLive();
-    page_ = relation_->first_;
+    if (!open_) throw DbError("temporary reader is closed");
+    run_.store_->CheckActive();
+    page_ = run_.first_;
     slot_ = 0;
     pages_read_ = rows_read_ = 0;
     loaded_ = false;
 }
 bool TempReader::Next(Tuple& out) {
-    if (!relation_) throw DbError("temporary reader is closed");
-    auto& relation = *relation_;
-    relation.CheckLive();
+    if (!open_) throw DbError("temporary reader is closed");
+    const auto& run = run_;
+    run.store_->CheckActive();
     while (page_ != kInvalidPageId) {
         if (!loaded_) {
-            if (pages_read_ >= relation.pages_) throw DbError("temporary page chain too long");
+            if (pages_read_ >= run.pages_) throw DbError("temporary page chain too long");
             {
-                auto guard = relation.store_.db_.Buffer().Fetch({FileKind::Temporary, page_});
+                auto guard = run.store_->db_.Buffer().Fetch({FileKind::Temporary, page_});
                 staging_ = guard.Data();
             }
             SlottedPage::Validate(staging_, page_, kInvalidPageId);
@@ -131,28 +120,27 @@ bool TempReader::Next(Tuple& out) {
         while (slot_ < SlottedPage::SlotCount(staging_)) {
             auto bytes = SlottedPage::Fetch(staging_, slot_++);
             if (!bytes) continue;
-            if (rows_read_ >= relation.rows_) throw DbError("temporary row count exceeded");
-            out = DecodeTuple(relation.schema_, *bytes);
+            if (rows_read_ >= run.rows_) throw DbError("temporary row count exceeded");
+            out = DecodeTuple(*run.schema_, *bytes);
             ++rows_read_;
             return true;
         }
         const PageId next = SlottedPage::Next(staging_);
         if ((next != kInvalidPageId && next <= page_) ||
-            (next == kInvalidPageId && page_ != relation.last_))
+            (next == kInvalidPageId && page_ != run.last_))
             throw DbError("invalid temporary page link");
         page_ = next;
         slot_ = 0;
         loaded_ = false;
     }
-    if (pages_read_ != relation.pages_ || rows_read_ != relation.rows_)
-        throw DbError("temporary relation counts disagree with its pages");
+    if (pages_read_ != run.pages_ || rows_read_ != run.rows_)
+        throw DbError("temporary run counts disagree with its pages");
     return false;
 }
 void TempReader::Close() noexcept {
-    if (!relation_) return;
-    --relation_->open_handles_;
-    --relation_->store_.open_handles_;
-    relation_ = nullptr;
+    if (!open_) return;
+    --run_.store_->open_handles_;
+    open_ = false;
 }
 
 }  // namespace valencedb

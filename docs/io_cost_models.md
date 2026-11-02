@@ -39,7 +39,7 @@ Textbook pass formulas and optimizer estimates omit allocation initialization. K
 
 ## Query scratch extent
 
-`allocated_temp_pages` is the cumulative physical allocation count for this query, including NewPage allocations whose frame acquisition failed. `current_temp_extent_pages` is the current append-only extent at allocation/reset boundaries. `peak_temp_extent_pages` is its historical maximum. During a query all three agree; after checked reset current becomes zero and the historical fields survive. `temp_relations_created` includes empty descriptors.
+`allocated_temp_pages` is the cumulative physical allocation count for this query, including NewPage allocations whose frame acquisition failed. `current_temp_extent_pages` is the current append-only extent at allocation/reset boundaries. `peak_temp_extent_pages` is its historical maximum. During a query all three agree; after checked reset current becomes zero and the historical fields survive. `temp_relations_created` counts writer constructions, including empty and abandoned runs; descriptor copies add nothing.
 
 Empty relations allocate no pages. Releasing a relation drops RAM handles without walking the chain, freeing pages, reusing IDs, performing reclamation I/O, or reducing any extent counter. Repeated Close→Init in one context adds to the same extent. The physical extent governs `max_temp_pages`, not the number of live descriptors. Low-level Buffer/Disk APIs must not bypass query-owned scratch allocation/reset.
 

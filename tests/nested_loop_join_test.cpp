@@ -644,9 +644,9 @@ void TempInputsAndFailure() {
         rows.emplace_back(std::vector<Value>{Value(i % 5), Value(std::string(256, static_cast<char>(i)))});
     for (bool block : {false, true}) for (auto side : sides) {
         QueryContext q(db);
-        TempRelation relation(q.Temps(), schema);
-        Throws([&] { TempScan scan(q, relation); }, "sealed");
-        { TempWriter writer(relation); for (const auto& row : rows) writer.Append(row); writer.Seal(); }
+        TempWriter writer(q.Temps(), schema);
+        for (const auto& row : rows) writer.Append(row);
+        auto relation = writer.Finish();
         { QueryContext foreign(other); Throws([&] { TempScan scan(foreign, relation); }, "query"); foreign.Close(); }
         auto join = MakeJoin(q, block, {0, 0, side}, std::make_unique<TempScan>(q, relation),
             std::make_unique<TempScan>(q, relation), Allowance(schema, schema, side, 7));
@@ -671,8 +671,9 @@ void TempInputsAndFailure() {
     // A real TempReader read fails after a valid prefix, with no EOF or pin leak.
     {
         QueryContext q(db);
-        TempRelation relation(q.Temps(), schema);
-        { TempWriter writer(relation); for (const auto& row : rows) writer.Append(row); writer.Seal(); }
+        TempWriter writer(q.Temps(), schema);
+        for (const auto& row : rows) writer.Append(row);
+        auto relation = writer.Finish();
         BlockNestedLoopJoin join(q, {0, 0}, std::make_unique<TempScan>(q, relation),
             std::make_unique<TempScan>(q, relation), Allowance(schema, schema, PhysicalOuter::Left, 3));
         join.Init(); Tuple row({}); VDB_CHECK(join.Next(row));
@@ -685,9 +686,8 @@ void TempInputsAndFailure() {
         VDB_CHECK(!join.Exhausted());
         Throws([&] { q.FinishQuery(join); }, "EOF");
         join.Close(); join.Close(); Pins(db);
-        relation.Release();
-        Throws([&] { TempScan scan(q, relation); }, "released");
         q.Close(); VDB_CHECK(!q.Succeeded()); Clean(db, files);
+        Throws([&] { TempScan scan(q, relation); }, "closed");
     }
     db.Close(); other.Close();
 }

@@ -111,7 +111,7 @@ At a high level:
                               |
                     owning Executor tree
                     /                 \
-          Database / B+ tree       TempRelations
+          Database / B+ tree       TempRuns
                     \                 /
                      shared BufferPool
                               |

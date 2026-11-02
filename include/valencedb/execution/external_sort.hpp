@@ -43,7 +43,7 @@ public:
     const ExternalSortMetrics& Metrics() const noexcept { return metrics_; }
 private:
     enum class Phase { Closed, GeneratingRuns, PrivateRun, Merging, Streaming };
-    using Runs = std::vector<std::unique_ptr<TempRelation>>;
+    using Runs = std::vector<TempRun>;
     struct MergeInput {
         std::unique_ptr<TempReader> reader;
         Tuple head{{}}; // The only owned head for this input.

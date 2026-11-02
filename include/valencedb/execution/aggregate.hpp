@@ -59,7 +59,7 @@ private:
     AggregateState global_;
     std::unique_ptr<Table> table_;
     Table::const_iterator position_{};
-    std::unique_ptr<TempRelation> partials_;
+    std::optional<TempRun> partials_;
     std::unique_ptr<TempWriter> writer_;
     std::unique_ptr<ExternalSort> sort_;
     std::optional<Tuple> lookahead_;

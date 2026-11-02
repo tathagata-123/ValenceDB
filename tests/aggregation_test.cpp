@@ -19,7 +19,7 @@ struct AggregateTestAccess {
     static void HashPhase(const HashAggregate& a) {
         if (a.Metrics().used_internal_sort) {
             VDB_CHECK(!a.table_ && !a.writer_ && a.sort_ && a.partials_);
-            VDB_CHECK(a.partials_->Sealed());
+            VDB_CHECK(a.partials_->RowCount() == a.Metrics().spill_records);
             VDB_CHECK(a.sort_->Memory().max_bytes == a.Memory().sort_memory_bytes);
         } else if (a.spec_.group_column) {
             VDB_CHECK(a.table_ && !a.writer_ && !a.partials_ && !a.sort_);

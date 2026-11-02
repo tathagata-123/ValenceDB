@@ -9,7 +9,7 @@ ValenceDB connects a page-oriented row store to owned-tuple executors and a smal
                                 |
                     owning Executor tree, Next(Tuple&)
                        /                      \
-          Database / heap / B+ tree        TempRelations
+          Database / heap / B+ tree        TempRuns
                        \                      /
                          shared BufferPool (F)
                                 |
@@ -38,13 +38,13 @@ caller scope
 
 PageGuard -> one BufferPool pin
 TempReader / TempWriter -> one private PageBytes each
-TempRelation -> borrows TempStore and one immutable Schema
+TempRun -> sealed copyable value borrowing TempStore and one immutable Schema
 BPlusIterator -> borrows a stable tree; stores epoch/page/offset, no retained pin
 ```
 
 Database outlives the context, pool users and tree cursors. Context outlives **all** executors and temporary handles; it does not own the root. Construct the context before the plan so destruction reverses that order. Parent executors own children using `unique_ptr`; descriptors are inspection values, not executable ownership. Operator-owned schemas outlive their run/partition/partial descriptors and readers. `PageGuard::Drop` releases exactly one pin; no byte reference may outlive that pin. Catalog metadata and index handles do not retain page guards.
 
-Database physically opens the scratch file, while each QueryContext resets and exclusively uses it. There is one scratch stream for the active query, not one file per operator. `TempRelation::Release` drops RAM metadata only. Append-only IDs and extent remain charged until query cleanup.
+Database physically opens the scratch file, while each QueryContext resets and exclusively uses it. There is one scratch stream for the active query, not one file per operator. Dropping a TempRun value needs no cleanup; readers and scans own descriptor copies. Append-only IDs and extent remain charged until query cleanup.
 
 ## A representative pipeline
 

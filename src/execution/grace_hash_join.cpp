@@ -35,9 +35,13 @@ GraceHashJoinMemory ComputeGraceJoinMemory(const QueryResources& resources,
     if (m.max_bytes <= m.scratch_bytes)
         throw DbError("Grace join memory cannot cover scratch");
     const size_t available = RemainingMemory(m.max_bytes, m.scratch_bytes);
-    m.partition_count = std::min(size_t{64}, available / (kPageSize + 128));
+    // Both run arrays and per-pair diagnostics coexist with one side's writers.
+    constexpr size_t pair_bytes = 2 * kTempRunCharge + 64;
+    static_assert(sizeof(GraceHashJoinPairMetrics) <= 64);
+    m.partition_count = std::min(size_t{64},
+        available / (kPageSize + kTempHandleOverhead + pair_bytes));
     if (m.partition_count < 2) throw DbError("Grace join requires at least two partitions");
-    m.descriptor_bytes = CheckedMultiply(128, m.partition_count);
+    m.descriptor_bytes = CheckedMultiply(pair_bytes, m.partition_count);
     const size_t reserve = CheckedAdd(m.scratch_bytes, m.descriptor_bytes);
     if (m.max_bytes <= reserve) throw DbError("Grace join cannot cover descriptors");
     const size_t build_bytes = RemainingMemory(m.max_bytes, reserve);
@@ -72,8 +76,7 @@ void GraceHashJoin::Partition(Executor& child, const Schema& schema, size_t key,
     parts.reserve(memory_.partition_count);
     writers.reserve(memory_.partition_count);
     for (size_t i = 0; i < memory_.partition_count; ++i) {
-        parts.push_back(std::make_unique<TempRelation>(context_.Temps(), schema));
-        writers.push_back(std::make_unique<TempWriter>(*parts.back()));
+        writers.push_back(std::make_unique<TempWriter>(context_.Temps(), schema));
     }
     metrics_.peak_partition_writers = std::max(metrics_.peak_partition_writers, writers.size());
     child.Init();
@@ -83,17 +86,17 @@ void GraceHashJoin::Partition(Executor& child, const Schema& schema, size_t key,
         writers[partition]->Append(row);
     }
     child.Close();
-    for (auto& writer : writers) writer->Seal();
+    for (auto& writer : writers) parts.push_back(writer->Finish());
     for (size_t i = 0; i < parts.size(); ++i) {
         auto& counters = metrics_.pairs[i];
         if (phase_ == Phase::PartitionLeft) {
-            counters.left_rows = parts[i]->RowCount();
-            counters.left_pages = parts[i]->PageCount();
+            counters.left_rows = parts[i].RowCount();
+            counters.left_pages = parts[i].PageCount();
         } else {
-            counters.right_rows = parts[i]->RowCount();
-            counters.right_pages = parts[i]->PageCount();
+            counters.right_rows = parts[i].RowCount();
+            counters.right_pages = parts[i].PageCount();
         }
-        metrics_.partition_write_pages = CheckedAdd(metrics_.partition_write_pages, parts[i]->PageCount());
+        metrics_.partition_write_pages = CheckedAdd(metrics_.partition_write_pages, parts[i].PageCount());
     }
 }
 
@@ -117,17 +120,17 @@ void GraceHashJoin::Init() {
 bool GraceHashJoin::Build(size_t capacity) {
     phase_ = Phase::Build;
     const bool left = build_side_ == PhysicalOuter::Left;
-    auto& relation = *(left ? left_parts_[pair_] : right_parts_[pair_]);
+    const auto& run = left ? left_parts_[pair_] : right_parts_[pair_];
     table_ = std::make_unique<Table>();
     table_->max_load_factor(1.0f);
     // Reserve only the known rows, bounded by the explicit capacity, including on defensive tests.
-    const size_t reserved_rows = std::min(relation.RowCount(), capacity);
+    const size_t reserved_rows = std::min(run.RowCount(), capacity);
     table_->reserve(reserved_rows);
     metrics_.modeled_peak_build_bytes = std::max(metrics_.modeled_peak_build_bytes,
         CheckedAdd(CheckedAdd(memory_.scratch_bytes, memory_.descriptor_bytes),
-            CheckedMultiply(reserved_rows, HashBuildRowCharge(relation.OutputSchema()))));
+            CheckedMultiply(reserved_rows, HashBuildRowCharge(run.OutputSchema()))));
     {
-        TempReader reader(relation);
+        TempReader reader(run);
         Tuple row({});
         while (reader.Next(row)) {
             if (table_->size() >= capacity) {
@@ -142,8 +145,8 @@ bool GraceHashJoin::Build(size_t capacity) {
             metrics_.peak_build_rows = std::max(metrics_.peak_build_rows, table_->size());
         }
     } // Build reader and its page are destroyed before opening probe.
-    metrics_.completed_hash_read_pages = CheckedAdd(metrics_.completed_hash_read_pages, relation.PageCount());
-    probe_ = std::make_unique<TempReader>(*(left ? right_parts_[pair_] : left_parts_[pair_]));
+    metrics_.completed_hash_read_pages = CheckedAdd(metrics_.completed_hash_read_pages, run.PageCount());
+    probe_ = std::make_unique<TempReader>(left ? right_parts_[pair_] : left_parts_[pair_]);
     match_ = match_end_ = table_->cend();
     auto& counters = metrics_.pairs[pair_];
     counters.strategy = GracePairStrategy::Hash;
@@ -157,8 +160,8 @@ bool GraceHashJoin::Build(size_t capacity) {
 
 void GraceHashJoin::BeginFallback() {
     assert(!table_ && !probe_ && probe_row_.size() == 0);
-    const auto& l = *left_parts_[pair_];
-    const auto& r = *right_parts_[pair_];
+    const auto& l = left_parts_[pair_];
+    const auto& r = right_parts_[pair_];
     // Prefer fewer complete inner scans; tie goes to logical Left. No global optimizer.
     PhysicalOuter outer = PhysicalOuter::Left;
     if (!memory_.left_block_capacity || (memory_.right_block_capacity &&
@@ -166,8 +169,8 @@ void GraceHashJoin::BeginFallback() {
         outer = PhysicalOuter::Right;
     fallback_ = std::make_unique<BlockNestedLoopJoin>(context_,
         JoinPlan{plan_.left_key, plan_.right_key, outer},
-        std::make_unique<TempScan>(context_, *left_parts_[pair_]),
-        std::make_unique<TempScan>(context_, *right_parts_[pair_]), memory_.fallback_memory);
+        std::make_unique<TempScan>(context_, left_parts_[pair_]),
+        std::make_unique<TempScan>(context_, right_parts_[pair_]), memory_.fallback_memory);
     fallback_->Init();
     auto& counters = metrics_.pairs[pair_];
     counters.strategy = GracePairStrategy::Fallback;
@@ -179,8 +182,8 @@ void GraceHashJoin::BeginFallback() {
 
 bool GraceHashJoin::SelectPair() {
     while (pair_ < memory_.partition_count) {
-        const auto& l = *left_parts_[pair_];
-        const auto& r = *right_parts_[pair_];
+        const auto& l = left_parts_[pair_];
+        const auto& r = right_parts_[pair_];
         if (!l.RowCount() || !r.RowCount()) {
             metrics_.pairs[pair_].strategy = GracePairStrategy::Empty;
             ++metrics_.empty_pairs;
@@ -205,8 +208,6 @@ void GraceHashJoin::ReleasePair() noexcept {
     match_ = match_end_ = Table::const_iterator{};
     table_.reset();
     probe_row_ = Tuple({});
-    left_parts_[pair_].reset();
-    right_parts_[pair_].reset();
     ++pair_;
     phase_ = Phase::SelectPair;
 }

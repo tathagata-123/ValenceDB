@@ -51,7 +51,7 @@ private:
     enum class Phase { Closed, PartitionLeft, PartitionRight, SelectPair, Build, Probe, Fallback, Done };
     struct BuildHash { size_t operator()(int64_t key) const noexcept; };
     using Table = std::unordered_multimap<int64_t, Tuple, BuildHash>;
-    using Partitions = std::vector<std::unique_ptr<TempRelation>>;
+    using Partitions = std::vector<TempRun>;
 
     GraceHashJoinPlan plan_;
     std::unique_ptr<Executor> left_, right_;

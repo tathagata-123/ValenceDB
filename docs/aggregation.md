@@ -62,16 +62,18 @@ The group table is an ordinary `unordered_map<int64_t, AggregateState>`. One bou
 
 For every owned input row, first look up its key. Existing groups update in place, including when the map is full. A new group inserts if there is a slot. A new key at capacity triggers a flush:
 
-1. On the first overflow, create one TempRelation and one writer.
+1. On the first overflow, create one TempWriter borrowing the immutable partial schema.
 2. Append every map entry as a raw partial-state row.
 3. Count one completed nonempty spill batch, then clear entries while keeping the reserved buckets for this hash phase.
 4. Insert/update the triggering input row exactly once and continue the original child.
 
-The loop's owned Tuple remains alive throughout the flush, so no replay, duplicate fetch, or lost trigger is necessary. There is only one accumulating partial relation and one writer across all batches. Repeated keys reduce table pressure; row count alone never causes a spill. Tests fill the table exactly and continue updating existing keys, and also perform 20,000 updates across two keys without spilling.
+The loop's owned Tuple remains alive throughout the flush, so no replay, duplicate fetch, or lost trigger is necessary. There is only one writer accumulating the partial page chain across all batches. Repeated keys reduce table pressure; row count alone never causes a spill. Tests fill the table exactly and continue updating existing keys, and also perform 20,000 updates across two keys without spilling.
+
+After the final partial batch, Finish publishes one TempRun stored in optional<TempRun>. TempScan copies that descriptor, and the writer object is destroyed before sorting. The existing combine scratch allowance covers these small value copies and reader metadata; the separate page allowance covers TempScan staging.
 
 If no overflow occurred, close the child and stream finalized rows directly from the stable bounded map. There is no separate collection of output rows and no temporary allocation.
 
-If any overflow occurred, EOF requires flushing **every remaining map entry** as the final nonempty batch. Seal the relation, destroy the writer and its private page, close the consumed raw child, and destroy the **entire map including buckets**. The local input Tuple has also left scope. Only then create and initialize the internal ExternalSort over a TempScan of the sealed partial relation. A source assertion and test inspection check this ownership transition. Merely clearing the map would retain its large reservation and is insufficient here.
+If any overflow occurred, EOF requires flushing **every remaining map entry** as the final nonempty batch. Finish the writer, destroy the writer and its private page, close the consumed raw child, and destroy the **entire map including buckets**. The local input Tuple has also left scope. Only then create and initialize the internal ExternalSort over a TempScan of the completed partial run. A source assertion and test inspection check this ownership transition. Merely clearing the map would retain its large reservation and is insufficient here.
 
 Worked example with capacity=2:
 
@@ -80,7 +82,7 @@ raw groups: 1,2,3,1
 1,2:        map={1,2}, full
 3:          spill partial(1), partial(2); map={3}
 1:          map={3,1}
-EOF:        final flush partial(3), partial(1); seal
+EOF:        final flush partial(3), partial(1); finish
 release:    writer and complete map destroyed
 sort:       partial keys 1,1,2,3
 combine:    one result for 1, one for 2, one for 3
@@ -159,7 +161,7 @@ The executor lifecycle is unchanged: construction validates, Init starts one exe
 
 TempReader/Writer transfer page images through brief BufferPool guards. Aggregates own no PageGuard and retain none across child calls, output, or sort phases. All tests use F=8, with active pins=0 at checked boundaries and peak pins=1.
 
-Spill and sort share the existing append-only scratch file. Relation release drops RAM handles with **zero page-reclamation I/O**; it never walks chains, recycles PageIds, or reduces physical extent. Released runs, previous replay executions, and abandoned allocations count against max_temp_pages until checked query finish/cancellation. Tests exhaust the cap during partial writing and sorting, and demonstrate replay consuming an additional page before failing at the cumulative limit.
+Spill and sort share the existing append-only scratch file. Dropping run descriptors releases their storage with **zero page-reclamation I/O**; it never walks chains, recycles PageIds, or reduces physical extent. Dropped runs, previous replay executions, and abandoned allocations count against max_temp_pages until checked query finish/cancellation. Tests exhaust the cap during partial writing and sorting, and demonstrate replay consuming an additional page before failing at the cumulative limit.
 
 DbError propagates for overflow, resource exhaustion, and child/I/O errors; these never become EOF or successful partial results. Callers discard any emitted prefix, close the tree, and call checked QueryContext::Close on failure. Success requires observed EOF and successful FinishQuery cleanup. Structural I/O errors retain the existing abandon-instance policy; there is no recovery/retry subsystem.
 

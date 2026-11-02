@@ -176,10 +176,7 @@ void HashAggregate::ConsumeHash() {
 
 void HashAggregate::FlushBatch() {
     if (table_->empty()) return;
-    if (!partials_) {
-        partials_ = std::make_unique<TempRelation>(context_.Temps(), partial_schema_);
-        writer_ = std::make_unique<TempWriter>(*partials_);
-    }
+    if (!writer_) writer_ = std::make_unique<TempWriter>(context_.Temps(), partial_schema_);
     for (const auto& [key, state] : *table_) {
         writer_->Append(Tuple({Value(key), Value(state.count), Value(state.sum),
             Value(state.min), Value(state.max), Value(int64_t{state.has_value})}));
@@ -190,7 +187,7 @@ void HashAggregate::FlushBatch() {
 }
 
 void HashAggregate::SortPartials() {
-    assert(!table_ && !writer_ && partials_->Sealed());
+    assert(!table_ && !writer_ && partials_);
     phase_ = Phase::SortPartials;
     // TempScan's reader owns a page outside ExternalSort's own model: subtract P.
     sort_ = std::make_unique<ExternalSort>(context_, ExternalSortPlan{0, memory_.sort_memory_bytes},
@@ -214,7 +211,7 @@ void HashAggregate::Init() {
             return;
         }
         ConsumeHash(); // Its input/trigger tuple dies before starting the sort phase.
-        if (!partials_) {
+        if (!writer_) {
             child_->Close();
             position_ = table_->cbegin();
             phase_ = Phase::EmitHash;
@@ -222,7 +219,7 @@ void HashAggregate::Init() {
         }
         phase_ = Phase::FlushFinal;
         FlushBatch();
-        writer_->Seal();
+        partials_ = writer_->Finish();
         writer_.reset(); // Destroy the staging array, not just its handle registration.
         child_->Close();
         table_.reset(); // Destroy nodes AND reserved buckets before ExternalSort exists.
@@ -260,7 +257,7 @@ bool HashAggregate::Next(Tuple& out) {
 void HashAggregate::Close() noexcept {
     child_->Close();
     if (sort_) metrics_.sort = sort_->Metrics();
-    sort_.reset(); // Destroys TempScan before its borrowed relation.
+    sort_.reset(); // Destroys TempScan and its reader.
     writer_.reset();
     partials_.reset();
     position_ = Table::const_iterator{};

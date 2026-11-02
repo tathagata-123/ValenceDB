@@ -20,16 +20,16 @@ ExternalSortMemory ComputeSortMemory(const QueryResources& resources, const Sche
     m.max_bytes = ResolveBudget(resources, override_bytes).max_bytes;
     m.row_bytes = RowMemoryCharge(schema);
     m.scratch_bytes = FixedScratchCharge(m.row_bytes);
-    m.descriptor_capacity = std::min(size_t{4096}, m.max_bytes / (16 * 64));
+    m.descriptor_capacity = std::min(size_t{4096}, m.max_bytes / (16 * kTempRunCharge));
     if (m.descriptor_capacity == 0) throw DbError("sort memory cannot hold run descriptors");
-    m.descriptor_bytes = CheckedMultiply(CheckedMultiply(2, m.descriptor_capacity), 64);
+    m.descriptor_bytes = CheckedMultiply(CheckedMultiply(2, m.descriptor_capacity), kTempRunCharge);
     const size_t reserve = CheckedAdd(m.scratch_bytes, m.descriptor_bytes);
     if (m.max_bytes <= reserve) throw DbError("sort memory cannot cover scratch and descriptors");
     const size_t available = RemainingMemory(m.max_bytes, reserve);
     m.run_capacity = available / m.row_bytes;
     if (m.run_capacity == 0 || m.run_capacity > std::vector<Tuple>().max_size())
         throw DbError("sort run capacity is zero or unrepresentable");
-    m.merge_fan_in = std::min(size_t{64}, available / CheckedAdd(kPageSize + 128, m.row_bytes));
+    m.merge_fan_in = std::min(size_t{64}, available / CheckedAdd(kPageSize + kTempHandleOverhead, m.row_bytes));
     return m;
 }
 
@@ -118,13 +118,9 @@ void ExternalSort::SpillRun() {
     assert(std::is_sorted(rows_.begin(), rows_.end(), [this](const Tuple& a, const Tuple& b) {
         return Key(a) < Key(b);
     }));
-    auto run = std::make_unique<TempRelation>(context_.Temps(), schema_);
-    {
-        TempWriter writer(*run);
-        for (const auto& row : rows_) writer.Append(row);
-        writer.Seal();
-    }
-    current_runs_.push_back(std::move(run));
+    TempWriter writer(context_.Temps(), schema_);
+    for (const auto& row : rows_) writer.Append(row);
+    current_runs_.push_back(writer.Finish());
     ++metrics_.initial_runs;
     ++metrics_.materialized_runs;
     metrics_.peak_run_descriptors = std::max(metrics_.peak_run_descriptors, current_runs_.size());
@@ -142,11 +138,11 @@ void ExternalSort::OpenMerge(size_t first, size_t count) {
     std::vector<HeapEntry> entries;
     entries.reserve(count);
     heap_ = Heap(GreaterKey{}, std::move(entries));
-    const size_t merge_bytes = CheckedMultiply(count, CheckedAdd(kPageSize + 128, memory_.row_bytes));
+    const size_t merge_bytes = CheckedMultiply(count, CheckedAdd(kPageSize + kTempHandleOverhead, memory_.row_bytes));
     metrics_.modeled_peak_bytes = std::max(metrics_.modeled_peak_bytes,
         CheckedAdd(CheckedAdd(memory_.scratch_bytes, memory_.descriptor_bytes), merge_bytes));
     for (size_t i = 0; i < count; ++i) {
-        inputs_.push_back({std::make_unique<TempReader>(*current_runs_[first + i]), Tuple({})});
+        inputs_.push_back({std::make_unique<TempReader>(current_runs_[first + i]), Tuple({})});
         auto& input = inputs_.back();
         if (input.reader->Next(input.head)) heap_.push({Key(input.head), i});
         else input.reader.reset();
@@ -174,21 +170,17 @@ void ExternalSort::MergePasses() {
             if (next_runs_.size() >= memory_.descriptor_capacity)
                 throw DbError("sort merge run descriptor cap exceeded");
             if (count == 1) {
-                next_runs_.push_back(std::move(current_runs_[first])); // Carry the odd run.
+                next_runs_.push_back(current_runs_[first]); // Carry the odd run.
             } else {
-                auto run = std::make_unique<TempRelation>(context_.Temps(), schema_);
-                // Unwind readers before their input descriptors; output writer is local RAII.
                 OpenMerge(first, count);
                 {
-                    TempWriter writer(*run);
+                    TempWriter writer(context_.Temps(), schema_);
                     Tuple row({});
                     while (PullMerge(row)) writer.Append(row);
-                    writer.Seal();
+                    next_runs_.push_back(writer.Finish());
                 }
                 CloseMerge();
-                next_runs_.push_back(std::move(run));
                 ++metrics_.materialized_runs;
-                for (size_t i = first; i < first + count; ++i) current_runs_[i].reset();
             }
             metrics_.peak_run_descriptors = std::max(metrics_.peak_run_descriptors, next_runs_.size());
             first += count;

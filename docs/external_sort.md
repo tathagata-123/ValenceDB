@@ -10,7 +10,7 @@ bounded chunk + std::sort -> sealed temporary runs
                          -> final merge streamed by Next
 ```
 
-The only retained tuple collection during generation is one bounded chunk. There is no complete external-result vector or final sorted TempRelation.
+The only retained tuple collection during generation is one bounded chunk. There is no complete external-result vector or final sorted TempRun.
 
 ## API and lifecycle
 
@@ -48,7 +48,7 @@ P = 4096
 Tinput = T(schema) = round_up_to_8(64 + 32*ncols + 2*max_encoded_row_bytes)
 S = 2*P + 3*Tinput + 1024
 D = min(4096, floor(M / (16*64)))         require D >= 1
-R = 2*D*64                              two descriptor arrays; R <= M/8
+R = 2*D*64                              two value-descriptor arrays; R <= M/8
 A = M - S - R                           require M > S+R before subtraction
 C_sort = floor(A / Tinput)              require C_sort >= 1
 k = min(64, floor(A / (P+Tinput+128)))
@@ -77,7 +77,7 @@ At exact capacity followed by EOF, the sorted chunk stays private and no empty r
 
 Sorting uses signed `as_int64()` comparisons with `<`, never serialized bytes or subtraction. Equal keys compare false in both directions. There is no tie RID, deduplication, or stability promise. One bounded std::sort is the intended algorithm.
 
-Before each spill, check current run count < D. Create one TempRelation borrowing the immutable Schema, append sorted tuples through one local TempWriter, Seal, destroy the writer, and retain its compact descriptor through unique_ptr. The nonmoving temporary-relation descriptor requires this stable address. There is no schema copy or page-ID list per run. Debug builds assert chunk sortedness; tests independently decode all materialized run chains, including obsolete runs.
+Before each spill, check current run count < D. Create a local TempWriter borrowing the immutable schema, append the sorted tuples, and push the sealed value returned by Finish into vector<TempRun>. There is no per-run heap allocation, schema copy, page-ID list, or stable-address requirement. Debug builds assert chunk sortedness; tests independently decode all materialized run chains, including obsolete runs.
 
 If the next initial run exceeds D, fail explicitly. No descriptor override is needed for tests: at M=24576, C_sort=14 and D=24, 337 rows exceed the cap. This finite input-run limit is intentional; generation does not merge early to bypass it.
 
@@ -89,7 +89,7 @@ Each merge group has at most k TempReaders and one decoded head per nonempty rea
 
 Readers use the existing private staging images: briefly fetch through BufferPool, copy page, release the guard, then decode rows. No sort state owns PageGuard. Fan-in depends on M, independently of F. Tests merge **11 readers with F=8**, observing peak pins=1.
 
-While current run count > k, partition current descriptors into groups of up to k. Merge each multi-run group into a sealed output TempRelation in the next descriptor array. A singleton group is **carried forward without copying**. Close/destroy the group's writer/readers before dropping obsolete input descriptors. At pass end, clear current, swap the two arrays, and reuse the emptied array. There is no collection per historical merge level.
+While current run count > k, partition current descriptors into groups of up to k. Merge each multi-run group through a writer into a completed TempRun in the next array. A singleton group carries its descriptor forward without page I/O. Destroy each group’s readers and writer before processing the next group. At pass end, clear current and swap the two arrays. There is no collection per historical merge level.
 
 Once run count <= k, open readers and initialize the final heap; **do not create a final writer or relation**. Every Next performs one merge step directly into the parent's output. No output buffer grows with result size. Empty final heap means EOF. The private path instead moves successive rows from its bounded sorted chunk.
 
@@ -102,11 +102,13 @@ pass 1: R0,R1,R2 -> A(72)
 final:  stream merge A,B -> parent, one tuple per Next
 ```
 
-There is no C(97) final TempRelation. A larger tested example uses M=24576 and 309 rows: **23 -> 12 -> 6 -> 3 -> 2** runs, four materialized passes, then a two-way streamed final merge. Singleton groups in the 23- and 3-run passes carry forward. There are 44 materialized runs total (23+11+6+3+1), not 45.
+There is no C(97) final TempRun. A larger tested example uses M=24576 and 309 rows: **23 -> 12 -> 6 -> 3 -> 2** runs, four materialized passes, then a two-way streamed final merge. Singleton groups in the 23- and 3-run passes carry forward. There are 44 materialized runs total (23+11+6+3+1), not 45.
 
 ## Temporary lifetime and measurements
 
-All runs share the query's one scratch file. Dropping obsolete descriptors releases RAM handles only. Their pages are neither traversed for freeing nor recycled, and their PageIds remain charged against max_temp_pages. This includes incomplete output runs on failure and previous replay state. Close never shrinks the file. FinishQuery/checked query.Close discard temporary cache entries after pin/handle checks, then reset scratch through QueryContext cleanup.
+The 64-byte descriptor allowance bounds sizeof(TempRun). Each merge input’s P+128 allowance includes its reader’s copied descriptor, page, cursor, allocation bookkeeping, pointer, and heap entry; RowMemoryCharge separately covers the tuple head and its owned data. Compile-time size checks enforce these bounds. Fixed scratch covers the output writer and transient descriptor copies.
+
+All runs share the query's one scratch file. Dropping obsolete descriptors removes value metadata only. Their pages are neither traversed for freeing nor recycled, and their PageIds remain charged against max_temp_pages. This includes incomplete output runs on failure and previous replay state. Close never shrinks the file. FinishQuery/checked query.Close discard temporary cache entries after pin/handle checks, then reset scratch through QueryContext cleanup.
 
 The 309-row full-width fixture cumulatively allocates **107 pages**. A separate cap test fits five initial one-page runs under a six-page limit, allocates one intermediate output page, then throws when its next page would exceed the cap. Replay tests show two original pages remain charged: under cap=3, replay allocates the third page then fails on the fourth. No successful output prefix is reported in either failure case.
 

@@ -3,15 +3,13 @@
 
 namespace valencedb {
 
-TempScan::TempScan(QueryContext& context, TempRelation& relation)
-    : Executor(context), relation_(relation) {
-    if (&relation.store_ != &context.Temps()) throw DbError("temp scan requires this query's relation");
-    relation.CheckLive();
-    if (!relation.Sealed()) throw DbError("temp scan requires a sealed relation");
+TempScan::TempScan(QueryContext& context, const TempRun& run)
+    : Executor(context), run_(run) {
+    if (run.store_ != &context.Temps()) throw DbError("temp scan requires this query's run");
 }
 void TempScan::Init() {
     Start();
-    try { reader_ = std::make_unique<TempReader>(relation_); }
+    try { reader_ = std::make_unique<TempReader>(run_); }
     catch (const std::bad_alloc&) {
         Close();
         throw DbError("temp scan memory allocation failed");
