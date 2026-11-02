@@ -16,20 +16,13 @@ struct GraceHashJoinMemory {
 };
 GraceHashJoinMemory ComputeGraceJoinMemory(const QueryResources&, const Schema& left,
     const Schema& right, const Schema& output, std::optional<size_t> memory_bytes = std::nullopt);
-enum class GracePairStrategy { Pending, Empty, Hash, Fallback };
-struct GraceHashJoinPairMetrics {
-    size_t left_rows = 0, right_rows = 0, left_pages = 0, right_pages = 0;
-    GracePairStrategy strategy = GracePairStrategy::Pending;
-    PhysicalOuter side = PhysicalOuter::Left; // Hash build side, or fallback outer.
-    size_t block_capacity = 0, inner_scans = 0;
-};
 struct GraceHashJoinMetrics {
-    std::vector<GraceHashJoinPairMetrics> pairs; // At most 64 compact counter records.
     size_t hash_pairs = 0, fallback_pairs = 0, empty_pairs = 0;
     size_t left_build_pairs = 0, right_build_pairs = 0;
     size_t peak_build_rows = 0, modeled_peak_build_bytes = 0, output_rows = 0;
-    size_t peak_partition_writers = 0, partition_write_pages = 0;
-    size_t completed_hash_read_pages = 0, completed_fallback_read_pages = 0;
+    size_t peak_partition_writers = 0;
+    size_t left_fallback_pairs = 0, right_fallback_pairs = 0;
+    size_t completed_fallback_inner_scans = 0; // Actual BNLJ scans, counted at pair EOF.
     size_t failed_build_rows = 0; // Extra prefix work on the defensive runtime-cap path.
 };
 
@@ -48,7 +41,7 @@ public:
     static uint64_t PartitionHash(int64_t key) noexcept;
 private:
     friend struct GraceHashJoinTestAccess; // Exercises the otherwise unreachable runtime cap.
-    enum class Phase { Closed, PartitionLeft, PartitionRight, SelectPair, Build, Probe, Fallback, Done };
+    enum class Phase { Closed, SelectPair, Probe, Fallback, Done };
     struct BuildHash { size_t operator()(int64_t key) const noexcept; };
     using Table = std::unordered_multimap<int64_t, Tuple, BuildHash>;
     using Partitions = std::vector<TempRun>;

@@ -152,3 +152,20 @@ Copy a successful runner record's `command` array to reproduce it, or add a stra
 ## Limitations
 
 Single-threaded, single-process, one active query; no SQL frontend, transactions, WAL/crash recovery, concurrency or MVCC. Clean flush/close/reopen is supported, not crash durability. One INT64 key/index per table, simple approximate optimizer statistics, finite sort descriptors and cumulative scratch limits remain. Schema charges and M are modeled memory rather than allocator/RSS measurements. Allocation flushes, filesystem caching, scheduling and bounded sink work affect elapsed time. Run order is deterministic rather than randomized; the three-repetition ranges are observations, not confidence intervals. No hardware/CPU/storage model is inferred from OS/architecture strings. No cold device-cache or cross-DBMS claims are made.
+
+## Phase 2 diagnostic schema
+
+New benchmark records use schema_version=2. Grace Join removes `pairs`,
+`partition_write_pages`, `completed_hash_read_pages`, and
+`completed_fallback_read_pages`. These copied descriptor data or derived logical
+transfers, not physical file I/O. New summary fields `left_fallback_pairs`,
+`right_fallback_pairs`, and `completed_fallback_inner_scans` report chosen fallback
+orientations and actual BNLJ inner scans from completed pairs. Existing path,
+output, peak-memory, BufferPool, DiskManager, and temporary-extent fields retain
+their meanings. Partial fallback scans are excluded from the new completed count.
+Compare older records by common counters and physical I/O; the old per-pair
+records can supply orientation and completed scan totals for successful runs.
+
+Removing the per-pair diagnostics changes the shared Grace memory formula to
+`p=min(64,(M-S)/(P+256))`, `Dghj=128*p`. This may change capacities or paths near
+boundaries; it does not change the per-operator budget or row charges.

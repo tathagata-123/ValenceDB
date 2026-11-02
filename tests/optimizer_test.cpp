@@ -681,8 +681,8 @@ void MemoryAndCost() {
             auto block = ComputeBlockJoinMemory(resources, schema, Narrow(), schema);
             VDB_CHECK(block.block_capacity == (memory - scratch) / t);
             auto grace = ComputeGraceJoinMemory(resources, schema, Narrow(), schema);
-            VDB_CHECK(grace.partition_count == std::min(size_t{64}, (memory - scratch) / 4416));
-            VDB_CHECK(grace.descriptor_bytes == 192 * grace.partition_count);
+            VDB_CHECK(grace.partition_count == std::min(size_t{64}, (memory - scratch) / 4352));
+            VDB_CHECK(grace.descriptor_bytes == 128 * grace.partition_count);
             VDB_CHECK(grace.left_build_capacity == (memory - scratch - grace.descriptor_bytes) / (t + 96));
             VDB_CHECK(grace.fallback_memory == memory - grace.descriptor_bytes);
             AggregateSpec spec{0, std::nullopt, true};

@@ -47,8 +47,7 @@ public:
     const AggregateMetrics& Metrics() const noexcept { return metrics_; }
 private:
     friend struct AggregateTestAccess;
-    enum class Phase { Closed, ConsumeHash, EmitGlobal, EmitHash, FlushFinal,
-                       SortPartials, CombinePartials, Done };
+    enum class Phase { Closed, EmitGlobal, EmitHash, CombinePartials, Done };
     using Table = std::unordered_map<int64_t, AggregateState>;
     AggregateSpec spec_;
     std::unique_ptr<Executor> child_;
@@ -59,13 +58,10 @@ private:
     AggregateState global_;
     std::unique_ptr<Table> table_;
     Table::const_iterator position_{};
-    std::optional<TempRun> partials_;
-    std::unique_ptr<TempWriter> writer_;
     std::unique_ptr<ExternalSort> sort_;
     std::optional<Tuple> lookahead_;
-    void ConsumeHash();
-    void FlushBatch();
-    void SortPartials();
+    std::optional<TempRun> BuildGroups();
+    void FlushBatch(Table& groups, TempWriter& writer);
 };
 
 class SortAggregate final : public Executor {
@@ -83,14 +79,12 @@ public:
 private:
     friend struct AggregateTestAccess;
     AggregateSpec spec_;
-    std::unique_ptr<Executor> child_; // Moves into sort_ only for unordered grouped input.
+    std::unique_ptr<Executor> input_; // Wrapped once at construction if sorting is needed.
     const Schema schema_;
     AggregateMemory memory_;
     AggregateMetrics metrics_;
-    std::unique_ptr<ExternalSort> sort_;
     std::optional<Tuple> lookahead_;
     bool global_emitted_ = false;
-    Executor& Input() { return sort_ ? static_cast<Executor&>(*sort_) : *child_; }
 };
 
 }  // namespace valencedb

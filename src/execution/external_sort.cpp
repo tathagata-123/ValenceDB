@@ -46,9 +46,7 @@ void ExternalSort::Init() {
     try {
         metrics_ = {};
         position_ = 0;
-        phase_ = Phase::GeneratingRuns;
         current_runs_.reserve(memory_.descriptor_capacity);
-        next_runs_.reserve(memory_.descriptor_capacity);
         rows_.reserve(memory_.run_capacity);
         metrics_.modeled_peak_bytes = CheckedAdd(
             CheckedAdd(memory_.scratch_bytes, memory_.descriptor_bytes),
@@ -57,17 +55,16 @@ void ExternalSort::Init() {
         GenerateRuns();
         child_->Close();
         if (current_runs_.empty()) {
-            phase_ = Phase::PrivateRun;
+            output_mode_ = OutputMode::PrivateRun;
             return;
         }
         // Run rows and their capacity must be gone before allocating reader staging pages.
         std::vector<Tuple>().swap(rows_);
-        phase_ = Phase::Merging;
         MergePasses();
         OpenMerge(0, current_runs_.size());
         metrics_.final_merge_fan_in = current_runs_.size();
         metrics_.final_merge_streamed = true;
-        phase_ = Phase::Streaming;
+        output_mode_ = OutputMode::Merge;
     } catch (const std::bad_alloc&) {
         Close();
         throw DbError("sort memory allocation failed");
@@ -164,29 +161,31 @@ bool ExternalSort::PullMerge(Tuple& out) {
 }
 
 void ExternalSort::MergePasses() {
+    Runs next_runs; // Exists only during blocking setup, never during streamed output.
+    next_runs.reserve(memory_.descriptor_capacity);
     while (current_runs_.size() > memory_.merge_fan_in) {
         for (size_t first = 0; first < current_runs_.size();) {
             const size_t count = std::min(memory_.merge_fan_in, current_runs_.size() - first);
-            if (next_runs_.size() >= memory_.descriptor_capacity)
+            if (next_runs.size() >= memory_.descriptor_capacity)
                 throw DbError("sort merge run descriptor cap exceeded");
             if (count == 1) {
-                next_runs_.push_back(current_runs_[first]); // Carry the odd run.
+                next_runs.push_back(current_runs_[first]); // Carry the odd run.
             } else {
                 OpenMerge(first, count);
                 {
                     TempWriter writer(context_.Temps(), schema_);
                     Tuple row({});
                     while (PullMerge(row)) writer.Append(row);
-                    next_runs_.push_back(writer.Finish());
+                    next_runs.push_back(writer.Finish());
                 }
                 CloseMerge();
                 ++metrics_.materialized_runs;
             }
-            metrics_.peak_run_descriptors = std::max(metrics_.peak_run_descriptors, next_runs_.size());
+            metrics_.peak_run_descriptors = std::max(metrics_.peak_run_descriptors, next_runs.size());
             first += count;
         }
         current_runs_.clear();
-        current_runs_.swap(next_runs_);
+        current_runs_.swap(next_runs);
         ++metrics_.intermediate_merge_passes;
     }
 }
@@ -194,7 +193,7 @@ void ExternalSort::MergePasses() {
 bool ExternalSort::Next(Tuple& out) {
     if (!Ready()) return false;
     try {
-        if (phase_ == Phase::PrivateRun) {
+        if (output_mode_ == OutputMode::PrivateRun) {
             if (position_ == rows_.size()) return End();
             out = std::move(rows_[position_++]);
             return true;
@@ -212,9 +211,7 @@ void ExternalSort::Close() noexcept {
     CloseMerge();
     std::vector<Tuple>().swap(rows_);
     Runs().swap(current_runs_);
-    Runs().swap(next_runs_);
     position_ = 0;
-    phase_ = Phase::Closed;
     CloseState(); // Scratch pages remain allocated until checked whole-query cleanup.
 }
 

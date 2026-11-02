@@ -18,22 +18,24 @@ namespace valencedb {
 struct AggregateTestAccess {
     static void HashPhase(const HashAggregate& a) {
         if (a.Metrics().used_internal_sort) {
-            VDB_CHECK(!a.table_ && !a.writer_ && a.sort_ && a.partials_);
-            VDB_CHECK(a.partials_->RowCount() == a.Metrics().spill_records);
+            VDB_CHECK(!a.table_ && a.sort_);
             VDB_CHECK(a.sort_->Memory().max_bytes == a.Memory().sort_memory_bytes);
         } else if (a.spec_.group_column) {
-            VDB_CHECK(a.table_ && !a.writer_ && !a.partials_ && !a.sort_);
+            VDB_CHECK(a.table_ && !a.sort_);
             VDB_CHECK(a.table_->size() <= a.Memory().hash_group_capacity);
-        } else VDB_CHECK(!a.table_ && !a.partials_ && !a.sort_);
+        } else VDB_CHECK(!a.table_ && !a.sort_);
     }
     static void Released(const HashAggregate& a) {
-        VDB_CHECK(!a.table_ && !a.writer_ && !a.sort_ && !a.partials_ && !a.lookahead_);
+        VDB_CHECK(!a.table_ && !a.sort_ && !a.lookahead_);
     }
     static void Released(const SortAggregate& a) { VDB_CHECK(!a.lookahead_); }
     static void Partials(HashAggregate& a) {
-        VDB_CHECK(a.partials_ && a.partials_->RowCount() == a.Metrics().spill_records);
-        VDB_CHECK(&a.partials_->OutputSchema() == &a.partial_schema_);
-        TempReader reader(*a.partials_);
+        a.child_->Init();
+        const auto partials = a.BuildGroups();
+        VDB_CHECK(partials && partials->RowCount() == a.Metrics().spill_records);
+        VDB_CHECK(!a.table_ && !a.sort_);
+        VDB_CHECK(&partials->OutputSchema() == &a.partial_schema_);
+        TempReader reader(*partials);
         Tuple row({});
         size_t count = 0;
         while (reader.Next(row)) {
@@ -217,7 +219,6 @@ AggregateMetrics Run(Database& db, const std::vector<Tuple>& rows, AggregateSpec
         auto& h = static_cast<HashAggregate&>(*a);
         VDB_CHECK(metrics.peak_hash_groups <= h.Memory().hash_group_capacity);
         VDB_CHECK(metrics.modeled_peak_hash_bytes <= h.Memory().max_bytes);
-        if (metrics.spill_batches) AggregateTestAccess::Partials(h);
     }
     if (!spec.group_column) {
         VDB_CHECK(metrics.peak_hash_groups == 0 && !metrics.used_internal_sort);
@@ -280,8 +281,7 @@ void Capacity() {
         VDB_CHECK(a.Metrics().spill_records == (offset > 0 ? groups : 0));
         VDB_CHECK(a.Metrics().used_internal_sort == (offset > 0));
         VDB_CHECK(state.inits == 1 && state.delivered == rows.size());
-        if (offset > 0) AggregateTestAccess::Partials(a);
-        else VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 0);
+        if (offset <= 0) VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 0);
         q.FinishQuery(a);
         Clean(db);
     }
@@ -313,7 +313,6 @@ void MultiSpill() {
     rows.push_back(Row(1000, -2));
     a.Init();
     AggregateTestAccess::HashPhase(a);
-    AggregateTestAccess::Partials(a);
     VDB_CHECK(a.Metrics().overflow_flushes == 3 && a.Metrics().spill_batches == 4);
     VDB_CHECK(a.Metrics().spill_records == 3 * cap + 4);
     VDB_CHECK(a.Metrics().sort.initial_runs > 2 && a.Metrics().sort.intermediate_merge_passes > 1);
@@ -340,6 +339,25 @@ void MultiSpill() {
     q.FinishQuery(a);
     AggregateTestAccess::Released(a);
     Clean(db);
+}
+
+// Inspect the sealed BuildGroups result directly, without retaining it in the executor.
+void RawPartials() {
+    Files files;
+    Database db(files.db, OpenMode::CreateNew, files.temp, 8);
+    for (auto spec : Specs()) {
+        QueryContext q(db, {kMemory, 16384});
+        std::vector<Tuple> rows;
+        for (int64_t i = 0; i < 600; ++i) rows.push_back(Row(i % 200, i % 17));
+        SourceState source;
+        HashAggregate a(q, spec, MakeSource(q, rows, source));
+        AggregateTestAccess::Partials(a);
+        VDB_CHECK(a.Metrics().spill_batches > 2);
+        VDB_CHECK(source.inits == 1 && source.delivered == rows.size() && source.closes == 1);
+        a.Close();
+        q.Close(); // No writer or reader survived BuildGroups / the inspection scope.
+        Clean(db);
+    }
 }
 
 void Overflow() {
@@ -847,7 +865,7 @@ void ScaleWidth() {
 int main(int argc, char** argv) {
     const std::vector<std::pair<std::string, std::function<void()>>> cases{
         {"semantics", Semantics}, {"capacity", Capacity}, {"multi_spill", MultiSpill},
-        {"overflow", Overflow}, {"validation", Validation}, {"capacity_one", CapacityOne},
+        {"raw_partials", RawPartials}, {"overflow", Overflow}, {"validation", Validation}, {"capacity_one", CapacityOne},
         {"ordered_sort", OrderedSort}, {"unordered_sort", UnorderedSort}, {"lifecycle", Lifecycle},
         {"temp_limits", TempLimits}, {"failures", Failures}, {"integration", Integration},
         {"randomized", Randomized}, {"scale_width", ScaleWidth}};

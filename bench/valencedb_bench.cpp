@@ -324,21 +324,8 @@ Json Algorithm(Executor& root, const Schema& input, const QueryResources& resour
 #define GM(field) j.Number(#field, m.field)
         GM(hash_pairs); GM(fallback_pairs); GM(empty_pairs); GM(left_build_pairs); GM(right_build_pairs);
         GM(peak_build_rows); GM(modeled_peak_build_bytes); GM(output_rows); GM(peak_partition_writers);
-        GM(partition_write_pages); GM(completed_hash_read_pages); GM(completed_fallback_read_pages); GM(failed_build_rows);
+        GM(left_fallback_pairs); GM(right_fallback_pairs); GM(completed_fallback_inner_scans); GM(failed_build_rows);
 #undef GM
-        std::string pairs = "[";
-        for (const auto& pair : m.pairs) {
-            Json q;
-            q.Number("left_rows", pair.left_rows); q.Number("right_rows", pair.right_rows);
-            q.Number("left_pages", pair.left_pages); q.Number("right_pages", pair.right_pages);
-            q.String("strategy", pair.strategy == GracePairStrategy::Hash ? "hash" :
-                pair.strategy == GracePairStrategy::Fallback ? "fallback" : "empty");
-            q.String("side", pair.side == PhysicalOuter::Left ? "left" : "right");
-            q.Number("C_block", pair.block_capacity); q.Number("inner_scans", pair.inner_scans);
-            if (pairs.size() > 1) pairs += ',';
-            pairs += q.Dump();
-        }
-        j.fields["pairs"] = pairs + ']';
         Require(m.output_rows == count, "GHJ counter mismatch");
     } else {
         const AggregateMemory* b = nullptr; const AggregateMetrics* m = nullptr;
@@ -724,7 +711,7 @@ void Run(const Config& c, Json& record, std::string& stage) {
 
 int main(int argc, char** argv) {
     Config c; Json record; std::string stage = "cli";
-    record.Number("schema_version", 1); record.Bool("success", false);
+    record.Number("schema_version", 2); record.Bool("success", false);
     record.String("build_type", VALENCEDB_BENCH_BUILD_TYPE);
     record.String("compiler", VALENCEDB_BENCH_COMPILER);
     record.String("platform", VALENCEDB_BENCH_PLATFORM);

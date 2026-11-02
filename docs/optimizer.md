@@ -94,7 +94,7 @@ Planner and executors call the **same** small Compute helpers in their existing 
 | Operator | Derivation |
 |---|---|
 | BNLJ | `S=2P+3*max(Tleft,Tright,Toutput)+1024`; require M>S; `C_block=(M-S)/Touter >=1` |
-| GHJ | same S; `p=min(64,(M-S)/(P+128)) >=2`; `Dghj=128p`; `build(side)=(M-S-Dghj)/(Tside+96)`; fallback M=`M-Dghj`, at least one legal fallback block |
+| GHJ | same S; `p=min(64,(M-S)/(P+256)) >=2`; `Dghj=128p`; `build(side)=(M-S-Dghj)/(Tside+96)`; fallback M=`M-Dghj`, at least one legal fallback block |
 | ExternalSort | `S=2P+3*Tinput+1024`; `D=min(4096,M/1024)`; `R=128D`; `C_sort=(M-S-R)/Tinput >=1`; `k=min(64,(M-S-R)/(P+Tinput+128))` |
 | HashAggregate | `Tmax=max(Tinput,Toutput,Tpartial)`; `S=2P+3*Tmax+1024`; grouped capacity=`(M-S)/192 >=1` |
 | Aggregate combine | `Ccombine=3*Tmax+1024`; global/ordered requires M>=Ccombine; hash internal Msort=`M-Ccombine-P`; unordered SortAggregate Msort=`M-Ccombine` |
@@ -145,7 +145,7 @@ Projection [2,0,1] rows=5 subtree_cost=6.0497 order=column 1
       M=32768 S=10296 group_capacity=117 internal_sort_budget=26568
       input_rows=64 local_cost=0.0128 subtree_cost=6.0485 output unordered
       GHJ [forced] rows=64 local_cost=4.0252 subtree_cost=6.0357
-        M=65536 S=10008 p=13 Dghj=1664 build=204,204 fallback_M=63872
+        M=65536 S=10008 p=12 Dghj=1536 build=204,204 fallback_M=64000
         Filter column 1>20 rows=80 selectivity=0.8 [fresh sampled]
           SeqScan employees rows=100 heap_pages=1 local_cost=1 ring=auto/off
         Filter column 0<4 rows=4 selectivity=0.8 [fresh sampled]

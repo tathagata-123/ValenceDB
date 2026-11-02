@@ -150,52 +150,48 @@ HashAggregate::HashAggregate(QueryContext& context, AggregateSpec spec,
       memory_(ComputeHashAggregateMemory(context.Resources(), child_->OutputSchema(), schema_,
           spec.group_column.has_value(), bytes)) {}
 
-void HashAggregate::ConsumeHash() {
-    table_ = std::make_unique<Table>();
-    table_->max_load_factor(1.0f);
-    table_->reserve(memory_.hash_group_capacity);
+std::optional<TempRun> HashAggregate::BuildGroups() {
+    auto groups = std::make_unique<Table>();
+    groups->max_load_factor(1.0f);
+    groups->reserve(memory_.hash_group_capacity);
+    std::unique_ptr<TempWriter> writer;
     metrics_.modeled_peak_hash_bytes = CheckedAdd(memory_.scratch_bytes,
         CheckedMultiply(memory_.hash_group_capacity, kAggregateGroupCharge));
-    Tuple row({}); // Owns the triggering row throughout FlushBatch; never refetch it.
+    Tuple row({}); // Owns the triggering row throughout the flush; never refetch it.
     while (child_->Next(row)) {
         ++metrics_.input_rows;
         const int64_t key = row.value(*spec_.group_column).as_int64();
-        auto found = table_->find(key);
-        if (found == table_->end()) {
-            if (table_->size() == memory_.hash_group_capacity) {
-                FlushBatch();
+        auto found = groups->find(key);
+        if (found == groups->end()) {
+            if (groups->size() == memory_.hash_group_capacity) {
+                if (!writer) writer = std::make_unique<TempWriter>(context_.Temps(), partial_schema_);
+                FlushBatch(*groups, *writer);
                 ++metrics_.overflow_flushes;
             }
-            found = table_->emplace(key, AggregateState{}).first;
-            metrics_.peak_hash_groups = std::max(metrics_.peak_hash_groups, table_->size());
+            found = groups->emplace(key, AggregateState{}).first;
+            metrics_.peak_hash_groups = std::max(metrics_.peak_hash_groups, groups->size());
         }
         found->second.Update(Measure(row, spec_), spec_);
-        assert(table_->size() <= memory_.hash_group_capacity);
+        assert(groups->size() <= memory_.hash_group_capacity);
     }
+    child_->Close();
+    if (!writer) {
+        table_ = std::move(groups); // Retain only the table needed for output iteration.
+        return std::nullopt;
+    }
+    FlushBatch(*groups, *writer);
+    return writer->Finish(); // Locals destroy the writer page, map buckets, and input row.
 }
 
-void HashAggregate::FlushBatch() {
-    if (table_->empty()) return;
-    if (!writer_) writer_ = std::make_unique<TempWriter>(context_.Temps(), partial_schema_);
-    for (const auto& [key, state] : *table_) {
-        writer_->Append(Tuple({Value(key), Value(state.count), Value(state.sum),
+void HashAggregate::FlushBatch(Table& groups, TempWriter& writer) {
+    if (groups.empty()) return;
+    for (const auto& [key, state] : groups) {
+        writer.Append(Tuple({Value(key), Value(state.count), Value(state.sum),
             Value(state.min), Value(state.max), Value(int64_t{state.has_value})}));
         ++metrics_.spill_records;
     }
     ++metrics_.spill_batches; // Every nonempty completed batch, including final flush.
-    table_->clear(); // Reuse reserved buckets only within the hash phase.
-}
-
-void HashAggregate::SortPartials() {
-    assert(!table_ && !writer_ && partials_);
-    phase_ = Phase::SortPartials;
-    // TempScan's reader owns a page outside ExternalSort's own model: subtract P.
-    sort_ = std::make_unique<ExternalSort>(context_, ExternalSortPlan{0, memory_.sort_memory_bytes},
-        std::make_unique<TempScan>(context_, *partials_));
-    metrics_.used_internal_sort = true;
-    sort_->Init();
-    metrics_.sort = sort_->Metrics();
-    phase_ = Phase::CombinePartials;
+    groups.clear(); // Reuse reserved buckets only within BuildGroups.
 }
 
 void HashAggregate::Init() {
@@ -204,26 +200,26 @@ void HashAggregate::Init() {
         metrics_ = {};
         global_ = {};
         child_->Init();
-        phase_ = Phase::ConsumeHash;
         if (!spec_.group_column) {
             global_ = ConsumeGlobal(*child_, spec_, metrics_);
             phase_ = Phase::EmitGlobal;
             return;
         }
-        ConsumeHash(); // Its input/trigger tuple dies before starting the sort phase.
-        if (!writer_) {
-            child_->Close();
+        const auto partials = BuildGroups();
+        if (!partials) {
             position_ = table_->cbegin();
             phase_ = Phase::EmitHash;
             return;
         }
-        phase_ = Phase::FlushFinal;
-        FlushBatch();
-        partials_ = writer_->Finish();
-        writer_.reset(); // Destroy the staging array, not just its handle registration.
-        child_->Close();
-        table_.reset(); // Destroy nodes AND reserved buckets before ExternalSort exists.
-        SortPartials();
+        // BuildGroups has released all build allocations before sorting starts.
+        assert(!table_);
+        // TempScan owns a staging page outside ExternalSort's reduced budget.
+        sort_ = std::make_unique<ExternalSort>(context_, ExternalSortPlan{0, memory_.sort_memory_bytes},
+            std::make_unique<TempScan>(context_, *partials));
+        metrics_.used_internal_sort = true;
+        sort_->Init();
+        metrics_.sort = sort_->Metrics();
+        phase_ = Phase::CombinePartials;
     } catch (const std::bad_alloc&) {
         Close(); throw DbError("hash aggregate memory allocation failed");
     } catch (const std::length_error&) {
@@ -258,8 +254,6 @@ void HashAggregate::Close() noexcept {
     child_->Close();
     if (sort_) metrics_.sort = sort_->Metrics();
     sort_.reset(); // Destroys TempScan and its reader.
-    writer_.reset();
-    partials_.reset();
     position_ = Table::const_iterator{};
     table_.reset();
     lookahead_.reset();
@@ -270,13 +264,13 @@ void HashAggregate::Close() noexcept {
 
 SortAggregate::SortAggregate(QueryContext& context, AggregateSpec spec,
     std::unique_ptr<Executor> child, std::optional<size_t> bytes)
-    : Executor(context), spec_(spec), child_(std::move(child)),
-      schema_(AggregateOutputSchema(AggregateInput(context, child_), spec)),
-      memory_(ComputeSortAggregateMemory(context.Resources(), child_->OutputSchema(), schema_,
-          spec.group_column && child_->OutputOrdering() != Ordering{true, *spec.group_column}, bytes)) {
-    if (spec.group_column && child_->OutputOrdering() != Ordering{true, *spec.group_column}) {
-        sort_ = std::make_unique<ExternalSort>(context_,
-            ExternalSortPlan{*spec.group_column, memory_.sort_memory_bytes}, std::move(child_));
+    : Executor(context), spec_(spec), input_(std::move(child)),
+      schema_(AggregateOutputSchema(AggregateInput(context, input_), spec)),
+      memory_(ComputeSortAggregateMemory(context.Resources(), input_->OutputSchema(), schema_,
+          spec.group_column && input_->OutputOrdering() != Ordering{true, *spec.group_column}, bytes)) {
+    if (spec.group_column && input_->OutputOrdering() != Ordering{true, *spec.group_column}) {
+        input_ = std::make_unique<ExternalSort>(context_,
+            ExternalSortPlan{*spec.group_column, memory_.sort_memory_bytes}, std::move(input_));
     }
 }
 
@@ -285,10 +279,11 @@ void SortAggregate::Init() {
     try {
         metrics_ = {};
         global_emitted_ = false;
-        metrics_.used_internal_sort = bool(sort_);
-        metrics_.input_order_reused = spec_.group_column.has_value() && !sort_;
-        Input().Init();
-        if (sort_) metrics_.sort = sort_->Metrics();
+        metrics_.used_internal_sort = memory_.sort_memory_bytes != 0;
+        metrics_.input_order_reused = spec_.group_column.has_value() && !metrics_.used_internal_sort;
+        input_->Init();
+        // A nonzero sort budget means construction wrapped input_ in exactly one ExternalSort.
+        if (metrics_.used_internal_sort) metrics_.sort = static_cast<ExternalSort&>(*input_).Metrics();
     } catch (const std::bad_alloc&) {
         Close(); throw DbError("sort aggregate memory allocation failed");
     } catch (...) { Close(); throw; }
@@ -299,9 +294,9 @@ bool SortAggregate::Next(Tuple& out) {
     try {
         if (!spec_.group_column) {
             if (global_emitted_) return End();
-            out = Finalize(0, ConsumeGlobal(Input(), spec_, metrics_), spec_);
+            out = Finalize(0, ConsumeGlobal(*input_, spec_, metrics_), spec_);
             global_emitted_ = true;
-        } else if (!NextGroup(Input(), spec_, false, lookahead_, metrics_, out)) {
+        } else if (!NextGroup(*input_, spec_, false, lookahead_, metrics_, out)) {
             return End();
         }
         ++metrics_.output_groups;
@@ -312,8 +307,8 @@ bool SortAggregate::Next(Tuple& out) {
 }
 
 void SortAggregate::Close() noexcept {
-    Input().Close(); // Keep the sorter/child tree for legal whole-execution replay.
-    if (sort_) metrics_.sort = sort_->Metrics();
+    input_->Close(); // Keep the sorter/child tree for legal whole-execution replay.
+    if (metrics_.used_internal_sort) metrics_.sort = static_cast<ExternalSort&>(*input_).Metrics();
     lookahead_.reset();
     global_emitted_ = false;
     CloseState();

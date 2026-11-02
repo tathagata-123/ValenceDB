@@ -42,7 +42,7 @@ public:
     const ExternalSortMemory& Memory() const noexcept { return memory_; }
     const ExternalSortMetrics& Metrics() const noexcept { return metrics_; }
 private:
-    enum class Phase { Closed, GeneratingRuns, PrivateRun, Merging, Streaming };
+    enum class OutputMode { PrivateRun, Merge };
     using Runs = std::vector<TempRun>;
     struct MergeInput {
         std::unique_ptr<TempReader> reader;
@@ -59,10 +59,10 @@ private:
     const Schema schema_; // Outlives every run; never copied into descriptors.
     ExternalSortMemory memory_;
     ExternalSortMetrics metrics_;
-    Phase phase_ = Phase::Closed;
+    OutputMode output_mode_ = OutputMode::PrivateRun;
     std::vector<Tuple> rows_;
     size_t position_ = 0;
-    Runs current_runs_, next_runs_;
+    Runs current_runs_;
     std::vector<MergeInput> inputs_;
     Heap heap_;
 

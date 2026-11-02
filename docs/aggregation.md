@@ -56,7 +56,7 @@ Both APIs use one state and consume their raw child once. They allocate no hash 
 
 ## Bounded HashAggregate
 
-Grouped execution follows explicit phases: ConsumeHash, EmitHash if everything fits, or FlushFinal, SortPartials, CombinePartials; global execution has EmitGlobal, and lifecycle includes Done/Closed.
+Grouped Init calls BuildGroups with a local map and optional writer. Persistent phases describe only output: EmitHash, CombinePartials, EmitGlobal, Done, and Closed. No setup phase needs to survive a call.
 
 The group table is an ordinary `unordered_map<int64_t, AggregateState>`. One bounded reserve sets max_load_factor(1.0f) and reserves the derived capacity. Admission checks the logical number of groups, without querying buckets or allocator internals.
 
@@ -69,7 +69,7 @@ For every owned input row, first look up its key. Existing groups update in plac
 
 The loop's owned Tuple remains alive throughout the flush, so no replay, duplicate fetch, or lost trigger is necessary. There is only one writer accumulating the partial page chain across all batches. Repeated keys reduce table pressure; row count alone never causes a spill. Tests fill the table exactly and continue updating existing keys, and also perform 20,000 updates across two keys without spilling.
 
-After the final partial batch, Finish publishes one TempRun stored in optional<TempRun>. TempScan copies that descriptor, and the writer object is destroyed before sorting. The existing combine scratch allowance covers these small value copies and reader metadata; the separate page allowance covers TempScan staging.
+After the final partial batch, BuildGroups returns optional<TempRun> from Finish. Its local map (including buckets), writer staging page, and input tuple are destroyed on return. Init constructs the sorter afterward; TempScan copies the returned descriptor. No partial descriptor or writer remains in HashAggregate. The existing combine scratch allowance covers these small value copies and reader metadata; the separate page allowance covers TempScan staging.
 
 If no overflow occurred, close the child and stream finalized rows directly from the stable bounded map. There is no separate collection of output rows and no temporary allocation.
 
@@ -155,9 +155,11 @@ Representative measured configuration for two INT64 input columns and all output
 
 The final merge streams. With M=65536, the scale fixture has capacity=287 and writes 21 batches/5741 partials. Maximum-width input tests exercise Tinput=4672 dominating Tpartial=360: S=23232 and Ccombine=15040. Narrow encoded partial states still determine ExternalSort's own row charge.
 
+SortAggregate owns one `unique_ptr<Executor> input_`. Construction wraps unordered grouped input in one ExternalSort using the reduced allowance; ordered input is used directly. Init, Next, and Close all use input_. Close preserves that tree for replay. The nonzero sort allowance identifies the wrapper for metric snapshots without a second pointer or dynamic cast. The optimizer still unwraps its displayed internal-sort plan node before constructing SortAggregate, so there is exactly one physical sorter.
+
 ## Lifetime, resources, and measurements
 
-The executor lifecycle is unchanged: construction validates, Init starts one execution, Next returns one owned row or EOF only, and Close is noexcept/idempotent. Close then Init is a new whole execution, permitted for replayable children. Init twice without Close rejects without cancelling the active execution. Metrics reset at Init and survive Close. Early Close destroys map, writer, sort working allocations, and lookahead, and closes the child tree. SortAggregate retains its closed sorter object for replay; ExternalSort::Close releases that object's working capacities.
+The executor lifecycle is unchanged: construction validates, Init starts one execution, Next returns one owned row or EOF only, and Close is noexcept/idempotent. Close then Init is a new whole execution, permitted for replayable children. Init twice without Close rejects without cancelling the active execution. Metrics reset at Init and survive Close. Early Close destroys the retained output map, sort working allocations, and lookahead, and closes the child tree. Setup locals unwind automatically on errors. SortAggregate retains its closed sorter object for replay; ExternalSort::Close releases that object's working capacities.
 
 TempReader/Writer transfer page images through brief BufferPool guards. Aggregates own no PageGuard and retain none across child calls, output, or sort phases. All tests use F=8, with active pins=0 at checked boundaries and peak pins=1.
 
@@ -190,6 +192,6 @@ Intentional limits: one NONNULL INT64 group key, one NONNULL INT64 measure, no N
 
 ## Source and self-check
 
-All aggregation code is in [aggregate.cpp](../src/execution/aggregate.cpp): `AggregateOutputSchema`, `AggregateState::Update/Combine`, `HashAggregate::ConsumeHash/FlushBatch/SortPartials`, and `SortAggregate::Next` through the local `NextGroup` helper. Header [aggregate.hpp](../include/valencedb/execution/aggregate.hpp) makes owned children, map, writer, partial relation, sorter and lookahead explicit. The partial Schema owner outlives every borrowed relation/reader.
+All aggregation code is in [aggregate.cpp](../src/execution/aggregate.cpp): `AggregateOutputSchema`, `AggregateState::Update/Combine`, `HashAggregate::BuildGroups/FlushBatch`, and `SortAggregate::Next` through the local `NextGroup` helper. Header [aggregate.hpp](../include/valencedb/execution/aggregate.hpp) shows only state needed across output calls: owned input, output map or partial sorter, aggregate state, and lookahead. The partial Schema owner outlives every borrowed relation/reader.
 
 The aggregation and integration tests cover triggering-row handoff, final flush, AVG sum/count recombination, selected-field overflow checks, ordered-input reuse, spilling across multiple batches, and cross-partition grouping.

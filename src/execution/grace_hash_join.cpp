@@ -35,9 +35,8 @@ GraceHashJoinMemory ComputeGraceJoinMemory(const QueryResources& resources,
     if (m.max_bytes <= m.scratch_bytes)
         throw DbError("Grace join memory cannot cover scratch");
     const size_t available = RemainingMemory(m.max_bytes, m.scratch_bytes);
-    // Both run arrays and per-pair diagnostics coexist with one side's writers.
-    constexpr size_t pair_bytes = 2 * kTempRunCharge + 64;
-    static_assert(sizeof(GraceHashJoinPairMetrics) <= 64);
+    // Both run arrays coexist with one side's writers.
+    constexpr size_t pair_bytes = 2 * kTempRunCharge;
     m.partition_count = std::min(size_t{64},
         available / (kPageSize + kTempHandleOverhead + pair_bytes));
     if (m.partition_count < 2) throw DbError("Grace join requires at least two partitions");
@@ -87,27 +86,13 @@ void GraceHashJoin::Partition(Executor& child, const Schema& schema, size_t key,
     }
     child.Close();
     for (auto& writer : writers) parts.push_back(writer->Finish());
-    for (size_t i = 0; i < parts.size(); ++i) {
-        auto& counters = metrics_.pairs[i];
-        if (phase_ == Phase::PartitionLeft) {
-            counters.left_rows = parts[i].RowCount();
-            counters.left_pages = parts[i].PageCount();
-        } else {
-            counters.right_rows = parts[i].RowCount();
-            counters.right_pages = parts[i].PageCount();
-        }
-        metrics_.partition_write_pages = CheckedAdd(metrics_.partition_write_pages, parts[i].PageCount());
-    }
 }
 
 void GraceHashJoin::Init() {
     Start();
     try {
         metrics_ = {};
-        metrics_.pairs.resize(memory_.partition_count);
-        phase_ = Phase::PartitionLeft;
         Partition(*left_, left_schema_, plan_.left_key, left_parts_);
-        phase_ = Phase::PartitionRight;
         Partition(*right_, right_schema_, plan_.right_key, right_parts_);
         phase_ = Phase::SelectPair;
     } catch (const std::bad_alloc&) {
@@ -118,7 +103,6 @@ void GraceHashJoin::Init() {
 }
 
 bool GraceHashJoin::Build(size_t capacity) {
-    phase_ = Phase::Build;
     const bool left = build_side_ == PhysicalOuter::Left;
     const auto& run = left ? left_parts_[pair_] : right_parts_[pair_];
     table_ = std::make_unique<Table>();
@@ -145,12 +129,8 @@ bool GraceHashJoin::Build(size_t capacity) {
             metrics_.peak_build_rows = std::max(metrics_.peak_build_rows, table_->size());
         }
     } // Build reader and its page are destroyed before opening probe.
-    metrics_.completed_hash_read_pages = CheckedAdd(metrics_.completed_hash_read_pages, run.PageCount());
     probe_ = std::make_unique<TempReader>(left ? right_parts_[pair_] : left_parts_[pair_]);
     match_ = match_end_ = table_->cend();
-    auto& counters = metrics_.pairs[pair_];
-    counters.strategy = GracePairStrategy::Hash;
-    counters.side = build_side_;
     ++metrics_.hash_pairs;
     if (left) ++metrics_.left_build_pairs;
     else ++metrics_.right_build_pairs;
@@ -172,10 +152,8 @@ void GraceHashJoin::BeginFallback() {
         std::make_unique<TempScan>(context_, left_parts_[pair_]),
         std::make_unique<TempScan>(context_, right_parts_[pair_]), memory_.fallback_memory);
     fallback_->Init();
-    auto& counters = metrics_.pairs[pair_];
-    counters.strategy = GracePairStrategy::Fallback;
-    counters.side = outer;
-    counters.block_capacity = fallback_->Memory().block_capacity;
+    if (outer == PhysicalOuter::Left) ++metrics_.left_fallback_pairs;
+    else ++metrics_.right_fallback_pairs;
     ++metrics_.fallback_pairs;
     phase_ = Phase::Fallback;
 }
@@ -185,7 +163,6 @@ bool GraceHashJoin::SelectPair() {
         const auto& l = left_parts_[pair_];
         const auto& r = right_parts_[pair_];
         if (!l.RowCount() || !r.RowCount()) {
-            metrics_.pairs[pair_].strategy = GracePairStrategy::Empty;
             ++metrics_.empty_pairs;
             ReleasePair();
             continue;
@@ -195,7 +172,12 @@ bool GraceHashJoin::SelectPair() {
         build_side_ = left_bytes <= right_bytes ? PhysicalOuter::Left : PhysicalOuter::Right;
         const bool left = build_side_ == PhysicalOuter::Left;
         const size_t capacity = left ? memory_.left_build_capacity : memory_.right_build_capacity;
-        if ((left ? l.RowCount() : r.RowCount()) > capacity || !Build(capacity)) BeginFallback();
+        const size_t build_rows = left ? l.RowCount() : r.RowCount();
+        if (build_rows > capacity) {
+            BeginFallback();
+        } else if (!Build(capacity)) {
+            BeginFallback(); // A defensive runtime cap check abandoned the entire table.
+        }
         return true;
     }
     phase_ = Phase::Done;
@@ -218,14 +200,12 @@ bool GraceHashJoin::Next(Tuple& out) {
         for (;;) {
             if (phase_ == Phase::SelectPair && !SelectPair()) return End();
             if (phase_ == Phase::Fallback) {
-                const bool found = fallback_->Next(out);
-                auto& counters = metrics_.pairs[pair_];
-                counters.inner_scans = fallback_->Metrics().inner_scans;
-                if (found) { ++metrics_.output_rows; return true; }
-                const bool left = counters.side == PhysicalOuter::Left;
-                metrics_.completed_fallback_read_pages = CheckedAdd(metrics_.completed_fallback_read_pages,
-                    CheckedAdd(left ? counters.left_pages : counters.right_pages,
-                        CheckedMultiply(counters.inner_scans, left ? counters.right_pages : counters.left_pages)));
+                if (fallback_->Next(out)) {
+                    ++metrics_.output_rows;
+                    return true;
+                }
+                metrics_.completed_fallback_inner_scans = CheckedAdd(
+                    metrics_.completed_fallback_inner_scans, fallback_->Metrics().inner_scans);
                 ReleasePair();
                 continue;
             }
@@ -238,9 +218,6 @@ bool GraceHashJoin::Next(Tuple& out) {
             }
             probe_row_ = Tuple({});
             if (!probe_->Next(probe_row_)) {
-                const auto& counters = metrics_.pairs[pair_];
-                metrics_.completed_hash_read_pages = CheckedAdd(metrics_.completed_hash_read_pages,
-                    build_side_ == PhysicalOuter::Left ? counters.right_pages : counters.left_pages);
                 ReleasePair();
                 continue;
             }

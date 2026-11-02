@@ -157,7 +157,7 @@ The public header is `execution/grace_hash_join.hpp`. `GraceHashJoinPlan` contai
 
 ### Partitioning and phase ownership
 
-The explicit phases are Closed, PartitionLeft, PartitionRight, SelectPair, Build, Probe, Fallback, and Done. Init creates p left writers, consumes left once to EOF, closes that child, and finishes every writer into a value descriptor. The local writer vector **and every writer object/private page are destroyed on return from Partition**, before the right-side call allocates its writers. It repeats exactly once for right using the same p. Both original children are closed before Init returns; Next never reopens them.
+The retained phases are Closed, SelectPair, Probe, Fallback, and Done. Partition and Build are synchronous functions, not persistent states. Init creates p left writers, consumes left once to EOF, closes that child, and finishes every writer into a value descriptor. The local writer vector **and every writer object/private page are destroyed on return from Partition**, before the right-side call allocates its writers. It repeats exactly once for right using the same p. Both original children are closed before Init returns; Next never reopens them.
 
 Each owned input tuple is appended once to `PartitionHash(key) % p`. PartitionHash converts signed INT64 to uint64_t before addition/mixing, so negative keys and both extremes have defined behavior. Its explicit integer mixer uses a fixed partition seed. The in-memory BuildHash uses the same mixer with a different fixed seed; no default implementation-dependent integer hash governs partition routing. Equal keys always route together. Neither hash is cryptographic.
 
@@ -177,8 +177,8 @@ Tright = T(right schema)
 Toutput = T(joined schema)
 T(schema) = round_up_to_8(64 + 32*ncols + 2*max_encoded_row_bytes)
 S = 2*P + 3*max(Tleft, Tright, Toutput) + 1024
-p = min(64, floor((M-S)/(P+320)))         require M>S and p>=2
-Dghj = 192*p                            both run arrays plus per-pair diagnostics
+p = min(64, floor((M-S)/(P+256)))         require M>S and p>=2
+Dghj = 128*p                            two run arrays; no diagnostic vector
 A = M-S-Dghj                            require M>S+Dghj
 Hside = Tside+96
 build_capacity(side) = floor(A/Hside)
@@ -186,15 +186,15 @@ fallback_memory = M-Dghj
 fallback_block_capacity(side) = floor(A/Tside)
 ```
 
-Each partition reserves two 64-byte run allowances, 64 bytes for pair counters, and P+128 for a writer, its pointer, and allocation overhead. Compile-time size checks protect those allowances. The planner calls the same capacity function as the executor.
+Each partition reserves two 64-byte run allowances and P+128 for a writer, its pointer, and allocation overhead. Compile-time size checks protect those allowances. The planner calls the same capacity function as the executor.
 
-Addition/multiplication are checked before use; every subtraction follows reserve validation. Vector/container size representability is checked. Both fallback outer capacities are derived at construction; at least one must be legal. Under current schema limits, a p-valid but row-infeasible fallback cannot occur: `M-S >= p*(P+320)` implies `A>=p*(P+128)>=8448`, whereas every legal T is at most 4672. Tests reject budgets just below p=2 and execute the minimum p=2 budget with maximum-width output. The explicit fallback guard remains, including representability checks.
+Addition/multiplication are checked before use; every subtraction follows reserve validation. Vector/container size representability is checked. Both fallback outer capacities are derived at construction; at least one must be legal. Under current schema limits, a p-valid but row-infeasible fallback cannot occur: `M-S >= p*(P+256)` implies `A>=p*(P+128)>=8448`, whereas every legal T is at most 4672. Tests reject budgets just below p=2 and execute the minimum p=2 budget with maximum-width output. The explicit fallback guard remains, including representability checks.
 
 For each nonempty pair compute checked `left_rows*(Tleft+96)` and `right_rows*(Tright+96)`. Choose the smaller **modeled byte footprint**, with ties choosing Left. A tested 10-row wide left has `10*816=8160` modeled bytes; a 12-row narrow right has `12*264=3168`, so Right builds despite having more rows. The mirrored case builds Left.
 
 Before opening a build reader, compare the selected descriptor row count with its capacity. Too many rows go straight to BNLJ. Since both sides use the same A, if the smaller footprint cannot fit, neither can the larger. There is no partial hash output followed by a different strategy.
 
-Representative two-INT64 schemas on both sides give Tleft=Tright=168, Toutput=264, S=10008. At M=20000, p=2, Dghj=384, both hash capacities are 36, fallback memory is 19616, and both BNLJ block capacities are 57. Tests cover selected build counts 35, 36, and 37: hash, hash, and fallback respectively.
+Representative two-INT64 schemas on both sides give Tleft=Tright=168, Toutput=264, S=10008. At M=20000, p=2, Dghj=256, both hash capacities are 36, fallback memory is 19744, and both BNLJ block capacities are 57. Tests cover selected build counts 35, 36, and 37: hash, hash, and fallback respectively.
 
 ### Bounded build and resumable probe
 
@@ -204,38 +204,33 @@ The entire build completes before any pair output. Then its reader and private s
 
 The runtime insertion check remains defensive even though sealed TempReader metadata normally makes it exact. If another build row would exceed capacity, close the build reader, destroy the entire hash object including buckets, destroy the local build tuple/page on return, and begin fallback before emitting. A small test friend directly calls Build with a reduced capacity to bypass the descriptor precheck: three rows retained, a fourth read triggers abandonment, zero hash outputs, and fallback emits the full 8-by-9=72 result. No fault scheduler or production corruption API was added. Ordinary corrupted temporary pages still raise DbError under the executor layer; this fallback does not repair corrupt storage.
 
-Probe EOF destroys the reader, table nodes/buckets, current tuple, and both pair handles. There is only one active hash table, never a table collection or output queue. Close likewise destroys all active state and both partition vector capacities, closes children, and preserves metric snapshots. Metric records contain counts only, at most 64; they do not retain relations or tuples.
+Probe EOF destroys the reader, table nodes/buckets, current tuple, and both pair handles. There is only one active hash table, never a table collection or output queue. Close likewise destroys all active state and both partition vector capacities, closes children, and preserves metric snapshots. The summary counters retain no partition records, relations, or tuples.
 
 ### Oversized pairs and skew fallback
 
 Fallback creates a fresh Nested-loop join BlockNestedLoopJoin over **two TempScans of this pair**, passing the numeric `M-Dghj`. The descriptors remain live, and no hash allocation remains. BNLJ applies its existing S/Touter formula; there is no second full-M grant or generic sub-budget layer. Choose a legal physical outer giving fewer `ceil(rows/C_block)` inner scans; ties choose Left. The choice is local and deterministic, not optimizer join selection.
 
-Next delegates directly to fallback.Next until EOF, then destroys the entire fallback before releasing the pair. TempScan replays the materialized inner partition, never an original child. The tested 120-by-130 all-key-7 pair exceeds both 36-row hash capacities and emits exactly **15600** rows through one fallback, with C_block=57 and three inner scans under M_fallback=19616. A wide-left/narrow-right fixture forces Right outer and matches standalone Nested-loop join BNLJ under the same reduced allowance.
+Next delegates directly to fallback.Next until EOF, then destroys the entire fallback before releasing the pair. TempScan replays the materialized inner partition, never an original child. The tested 120-by-130 all-key-7 pair exceeds both 36-row hash capacities and emits exactly **15600** rows through one fallback, with C_block=57 and three inner scans under M_fallback=19744. A wide-left/narrow-right fixture forces Right outer and matches standalone Nested-loop join BNLJ under the same reduced allowance.
 
 There is deliberately no recursive repartitioning. BNLJ guarantees termination with bounded retained state, reuses Nested-loop join, and keeps the algorithm inspectable. Severe skew can make comparisons and output quadratic. Output cardinality never increases retained output state.
 
-Worked example (tested at M=23000 with the two-INT64 schemas):
+Worked example (tested at M=23300 with the two-INT64 schemas):
 
 ```text
-p=3; Dghj=384; hash capacities=47; fallback C_block=75
+p=3; Dghj=384; hash capacities=48; fallback C_block=76
 Left:  L0(2 rows)  L1(90 rows)  L2(0)
 Right: R0(3 rows)  R1(95 rows)  R2(0)
 L0,R0 -> build Left, probe Right -> 6 streamed matches
-L1,R1 -> BNLJ with M=22616      -> 8550 streamed matches
+L1,R1 -> BNLJ with M=22916      -> 8550 streamed matches
 L2,R2 -> skip                   -> 0
 Total: one hash pair, one fallback pair, one empty pair; 8556 rows
 ```
 
 ### Metrics, scratch, and logical transfers
 
-`Memory()` returns GraceHashJoinMemory with the values in the formulas. `Metrics()` resets at Init and survives Close. `pairs` has p counter records: left/right row/page counts, strategy (Pending/Empty/Hash/Fallback), side (hash build or fallback outer), and fallback block capacity/inner scans. Records classify each completed pair into exactly one strategy. Summary counters report hash/fallback/empty pairs, left/right successful builds, peak retained build rows, modeled peak build bytes (S+Dghj+reserved_rows*Hside), output rows, peak partition writers, completed partition writes, completed hash reads, completed fallback reads, and failed-build prefix rows.
+`Memory()` returns GraceHashJoinMemory with the values in the formulas. `Metrics()` resets at Init and survives Close. Summary counters record hash/fallback/empty pairs, left/right successful builds and fallback outers, peak build rows, modeled peak build bytes (S+Dghj+reserved_rows*Hside), output rows, peak partition writers, and failed-build prefix rows. `completed_fallback_inner_scans` sums actual BNLJ inner scans only when each fallback reaches EOF; cancelled or failed partial pairs do not contribute.
 
-Logical transfer counters have precise completion boundaries:
-
-- `partition_write_pages`: sum of pages in successfully sealed input partition phases. It excludes original input reads, physical allocation initialization, and an incomplete failed partition phase.
-- `completed_hash_read_pages`: each successfully finished build/probe scan adds its relation pages. A current partial probe is not counted yet; a failed build prefix is excluded.
-- `completed_fallback_read_pages`: a completed fallback adds `outer_pages + inner_scans*inner_pages`. A current partial fallback is not counted yet. `inner_scans` itself updates during streaming.
-- `failed_build_rows`: extra rows read during abandoned build attempts, **including the row triggering the cap**, recorded separately; this is a row counter, not fabricated page-I/O data.
+Row/page counts remain solely in the sealed TempRuns. There is no per-partition metric vector or synthetic completed-read accounting. Tests decode partitions, check routing and tuple multisets, derive expected strategies and page scans from the descriptors, and compare expected transfers against BufferPool fetch deltas. Live hash-table and fallback block inspection verifies admission and reduced memory bounds. DiskManager temporary reads, writes, and allocations remain the source of physical file-I/O evidence, including failures.
 
 TempStore's existing `allocated_temp_pages`/`peak_temp_extent_pages` are cumulative **query** extent and include other operators. No subtraction on pair release occurs. Close and dropping descriptors perform **zero page-reclamation I/O**: no chain walk, reuse, or shrink. All pages, including released pairs, failed tails, and previous replay executions, count until checked FinishQuery or query cancellation resets scratch. TempScan/BNLJ fallback allocates no new temp pages. A downstream ExternalSort or a replay can exhaust the cap after old pair handles have been closed; tests cover both and propagate DbError, never truncated success.
 
@@ -245,7 +240,7 @@ With ideal equal packing, original input page counts N_R/N_S, and every pair fit
 N_R + N_S + 2*(partition_pages_R + partition_pages_S)
 ```
 
-This assumes the child scans cost those page reads and all partition pages participate. Empty-sided skipped pairs save their second-phase reads; per-partition tail waste changes packing. More precisely, temporary traffic for a completed execution is partition_write_pages + completed_hash_read_pages + completed_fallback_read_pages, plus any abandoned build prefix work.
+This assumes the child scans cost those page reads and all partition pages participate. Empty-sided skipped pairs save their second-phase reads; per-partition tail waste changes packing. Logical temporary traffic is partition writes plus build/probe page scans or fallback rescans, including any abandoned build prefix. Physical file traffic must be measured separately because cached transfers need no file I/O.
 
 For a fallback pair, **replace** the usual single read of both partitions with `pages(outer) + ceil(rows(outer)/C_block)*pages(inner)`. Do not also charge a nonexistent full hash scan. A defensive failed build adds its actually read prefix before the fallback; the separate row counter exposes this extra work, without claiming a page total for that prefix.
 

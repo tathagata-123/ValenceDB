@@ -39,6 +39,20 @@ struct GraceHashJoinTestAccess {
         VDB_CHECK(join.fallback_ && !join.table_ && !join.probe_);
         VDB_CHECK(join.fallback_->Memory().max_bytes == join.Memory().fallback_memory);
     }
+    static void CheckLiveMemory(const GraceHashJoin& join) {
+        if (join.table_) {
+            const bool left = join.build_side_ == PhysicalOuter::Left;
+            const auto capacity = left ? join.memory_.left_build_capacity : join.memory_.right_build_capacity;
+            VDB_CHECK(join.table_->size() <= capacity);
+            VDB_CHECK(!join.fallback_);
+        }
+        if (join.fallback_) {
+            FallbackBudget(join);
+            const auto& m = join.fallback_->Memory();
+            VDB_CHECK(join.fallback_->Metrics().peak_block_rows <= m.block_capacity);
+            VDB_CHECK(join.fallback_->Metrics().modeled_peak_bytes + join.memory_.descriptor_bytes <= join.memory_.max_bytes);
+        }
+    }
     static size_t HashRows(const GraceHashJoin& join) {
         return join.table_ ? join.table_->size() : 0;
     }
@@ -167,7 +181,11 @@ std::unique_ptr<Source> Child(QueryContext& q, const Schema& schema,
 std::vector<Tuple> Drain(Database& db, Executor& join) {
     std::vector<Tuple> result;
     Tuple out({Value(int64_t{123})});
-    while (join.Next(out)) { result.push_back(out); Pins(db); }
+    while (join.Next(out)) {
+        result.push_back(out);
+        if (auto* grace = dynamic_cast<GraceHashJoin*>(&join)) GraceHashJoinTestAccess::CheckLiveMemory(*grace);
+        Pins(db);
+    }
     VDB_CHECK(join.Exhausted());
     const auto before = result.empty() ? std::vector<std::byte>{} : EncodeTuple(join.OutputSchema(), out);
     VDB_CHECK(!join.Next(out));
@@ -194,15 +212,15 @@ void AuditPartitions(GraceHashJoin& join, const std::vector<Tuple>& left, const 
             schema = &part.OutputSchema();
             VDB_CHECK(part.ModeledRowBytes() == part.RowCount() * RowMemoryCharge(*schema));
             if (!part.RowCount()) VDB_CHECK(part.PageCount() == 0 && part.FirstPage() == kInvalidPageId);
-            const auto& m = join.Metrics().pairs[i];
-            VDB_CHECK(part.RowCount() == (is_left ? m.left_rows : m.right_rows));
-            VDB_CHECK(part.PageCount() == (is_left ? m.left_pages : m.right_pages));
             TempReader reader(parts[i]);
             Tuple row({});
+            size_t decoded_rows = 0;
             while (reader.Next(row)) {
                 VDB_CHECK(GraceHashJoin::PartitionHash(row.value(is_left ? lk : rk).as_int64()) % parts.size() == i);
                 decoded.push_back(row);
+                ++decoded_rows;
             }
+            VDB_CHECK(decoded_rows == part.RowCount());
             total += part.RowCount();
             pages += part.PageCount();
         }
@@ -210,41 +228,55 @@ void AuditPartitions(GraceHashJoin& join, const std::vector<Tuple>& left, const 
         VDB_CHECK(total == original.size());
         VDB_CHECK(Canonical(*schema, decoded) == Canonical(*schema, original));
     }
-    VDB_CHECK(join.Metrics().partition_write_pages == pages);
+    VDB_CHECK(join.Context().Db().Disk().PageCount(FileKind::Temporary) == pages);
     VDB_CHECK(join.Metrics().peak_partition_writers == join.Memory().partition_count);
     VDB_CHECK(join.Metrics().output_rows == 0 && join.Metrics().hash_pairs == 0);
 }
-void PairMetrics(const GraceHashJoin& join) {
+// Predict decisions and page transfers from sealed descriptors, independently of diagnostics.
+size_t PairMetrics(const GraceHashJoin& join) {
     const auto& metrics = join.Metrics();
-    VDB_CHECK(metrics.hash_pairs + metrics.fallback_pairs + metrics.empty_pairs == join.Memory().partition_count);
+    const auto& memory = join.Memory();
+    VDB_CHECK(metrics.hash_pairs + metrics.fallback_pairs + metrics.empty_pairs == memory.partition_count);
     VDB_CHECK(metrics.left_build_pairs + metrics.right_build_pairs == metrics.hash_pairs);
-    VDB_CHECK(metrics.modeled_peak_build_bytes <= join.Memory().max_bytes);
-    size_t hash_reads = 0, fallback_reads = 0, hash_pairs = 0, fallback_pairs = 0, empty_pairs = 0;
-    for (const auto& m : metrics.pairs) {
-        if (m.strategy == GracePairStrategy::Empty) {
-            ++empty_pairs;
-            VDB_CHECK(!m.left_rows || !m.right_rows);
-        } else if (m.strategy == GracePairStrategy::Hash) {
-            ++hash_pairs;
-            hash_reads += m.left_pages + m.right_pages;
-            const bool left = m.side == PhysicalOuter::Left;
-            VDB_CHECK((left ? m.left_rows : m.right_rows) <=
-                      (left ? join.Memory().left_build_capacity : join.Memory().right_build_capacity));
+    VDB_CHECK(metrics.left_fallback_pairs + metrics.right_fallback_pairs == metrics.fallback_pairs);
+    VDB_CHECK(metrics.modeled_peak_build_bytes <= memory.max_bytes);
+    const auto& left = GraceHashJoinTestAccess::Parts(join, true);
+    const auto& right = GraceHashJoinTestAccess::Parts(join, false);
+    if (left.empty()) return 0; // A consuming parent has already closed this child.
+    size_t reads = 0, hashes = 0, fallbacks = 0, empty = 0, scans = 0;
+    size_t left_builds = 0, right_builds = 0, left_fallbacks = 0, right_fallbacks = 0;
+    for (size_t i = 0; i < left.size(); ++i) {
+        const auto& l = left[i];
+        const auto& r = right[i];
+        if (!l.RowCount() || !r.RowCount()) { ++empty; continue; }
+        const bool build_left = l.RowCount() * (memory.left_row_bytes + 96) <=
+                                r.RowCount() * (memory.right_row_bytes + 96);
+        const size_t rows = build_left ? l.RowCount() : r.RowCount();
+        const size_t capacity = build_left ? memory.left_build_capacity : memory.right_build_capacity;
+        if (rows <= capacity && !(i == 0 && metrics.failed_build_rows)) {
+            ++hashes;
+            if (build_left) ++left_builds; else ++right_builds;
+            reads += l.PageCount() + r.PageCount();
         } else {
-            VDB_CHECK(m.strategy == GracePairStrategy::Fallback);
-            ++fallback_pairs;
-            const bool left = m.side == PhysicalOuter::Left;
-            const size_t rows = left ? m.left_rows : m.right_rows;
-            const size_t charge = left ? join.Memory().left_row_bytes : join.Memory().right_row_bytes;
-            VDB_CHECK(m.block_capacity == (join.Memory().fallback_memory - join.Memory().scratch_bytes) / charge);
-            VDB_CHECK(m.inner_scans == rows / m.block_capacity + (rows % m.block_capacity != 0));
-            fallback_reads += (left ? m.left_pages : m.right_pages) +
-                              m.inner_scans * (left ? m.right_pages : m.left_pages);
+            ++fallbacks;
+            const size_t left_blocks = (l.RowCount() - 1) / memory.left_block_capacity + 1;
+            const size_t right_blocks = (r.RowCount() - 1) / memory.right_block_capacity + 1;
+            if (left_blocks <= right_blocks) {
+                ++left_fallbacks;
+                scans += left_blocks;
+                reads += l.PageCount() + left_blocks * r.PageCount();
+            } else {
+                ++right_fallbacks;
+                scans += right_blocks;
+                reads += r.PageCount() + right_blocks * l.PageCount();
+            }
         }
     }
-    VDB_CHECK(hash_pairs == metrics.hash_pairs && fallback_pairs == metrics.fallback_pairs && empty_pairs == metrics.empty_pairs);
-    VDB_CHECK(hash_reads == metrics.completed_hash_read_pages);
-    VDB_CHECK(fallback_reads == metrics.completed_fallback_read_pages);
+    VDB_CHECK(hashes == metrics.hash_pairs && fallbacks == metrics.fallback_pairs && empty == metrics.empty_pairs);
+    VDB_CHECK(left_builds == metrics.left_build_pairs && right_builds == metrics.right_build_pairs);
+    VDB_CHECK(left_fallbacks == metrics.left_fallback_pairs && right_fallbacks == metrics.right_fallback_pairs);
+    VDB_CHECK(scans == metrics.completed_fallback_inner_scans);
+    return reads;
 }
 GraceHashJoinMetrics Run(const Schema& ls, const Schema& rs, const std::vector<Tuple>& left,
     const std::vector<Tuple>& right, size_t lk, size_t rk, size_t memory = 20000) {
@@ -262,10 +294,11 @@ GraceHashJoinMetrics Run(const Schema& ls, const Schema& rs, const std::vector<T
     }
     join.Init();
     AuditPartitions(join, left, right, lk, rk);
+    const auto fetches = db.Metrics().buffer_fetches;
     const auto output = Drain(db, join);
     VDB_CHECK(Canonical(join.OutputSchema(), output) == Reference(join.OutputSchema(), left, right, lk, rk));
     VDB_CHECK(output.size() == join.Metrics().output_rows);
-    PairMetrics(join);
+    VDB_CHECK(db.Metrics().buffer_fetches - fetches == PairMetrics(join));
     SingleConsumption(a, left.size());
     SingleConsumption(b, right.size());
     const auto result = join.Metrics();
@@ -284,10 +317,10 @@ void EmptyDisjoint() {
     for (bool l : {false, true}) for (bool r : {false, true}) {
         const auto m = Run(Narrow(), Narrow(), Rows(l ? 4 : 0, 7), Rows(r ? 3 : 0, 7), 0, 0);
         VDB_CHECK(m.output_rows == (l && r ? 12 : 0));
-        VDB_CHECK(m.partition_write_pages == size_t(l) + size_t(r));
+        VDB_CHECK(m.empty_pairs == (l && r ? 1 : 2));
     }
     const auto m = Run(Narrow(), Narrow(), Rows(70, -1), Rows(80, 42), 0, 0);
-    VDB_CHECK(m.output_rows == 0 && m.partition_write_pages >= 2);
+    VDB_CHECK(m.output_rows == 0 && m.hash_pairs + m.fallback_pairs + m.empty_pairs == 2);
     // Disjoint keys deliberately in one pair: exercise a real empty equal_range.
     const int64_t first = KeyFor(0, 2);
     int64_t second = first + 1;
@@ -325,10 +358,10 @@ void BoundariesAndSkew() {
     GraceHashJoin model(q, {0, 0, 20000}, Child(q, Narrow(), empty, a), Child(q, Narrow(), empty, b));
     const auto memory = model.Memory();
     VDB_CHECK(memory.left_row_bytes == 168 && memory.right_row_bytes == 168);
-    VDB_CHECK(memory.scratch_bytes == 10008 && memory.partition_count == 2 && memory.descriptor_bytes == 384);
+    VDB_CHECK(memory.scratch_bytes == 10008 && memory.partition_count == 2 && memory.descriptor_bytes == 256);
     VDB_CHECK(memory.left_build_capacity == 36 && memory.right_build_capacity == 36);
-    VDB_CHECK(memory.fallback_memory == 19616 && memory.left_block_capacity == 57);
-    std::cout << "model: M=20000 S=10008 p=2 Dghj=384 Tleft=Tright=168 capacity=36/36 fallback=19616 Cblock=57\n";
+    VDB_CHECK(memory.fallback_memory == 19744 && memory.left_block_capacity == 57);
+    std::cout << "model: M=20000 S=10008 p=2 Dghj=256 Tleft=Tright=168 capacity=36/36 fallback=19744 Cblock=57\n";
     q.Close();
     for (size_t n : {size_t{35}, size_t{36}, size_t{37}}) {
         const auto m = Run(Narrow(), Narrow(), Rows(n, 7), Rows(n + 1, 7), 0, 0);
@@ -341,28 +374,25 @@ void BoundariesAndSkew() {
     }
     const auto m = Run(Narrow(), Narrow(), Rows(120, 7), Rows(130, 7), 0, 0);
     VDB_CHECK(m.fallback_pairs == 1 && m.hash_pairs == 0 && m.peak_build_rows == 0 && m.output_rows == 15600);
-    const size_t p = GraceHashJoin::PartitionHash(7) % 2;
-    VDB_CHECK(m.pairs[p].side == PhysicalOuter::Left && m.pairs[p].inner_scans == 3);
-    std::cout << "all-equal skew: 120x130=15600; fallback_pairs=1; Cblock=57; scans=3; temp_pages="
-              << m.partition_write_pages << "; fallback read pages=" << m.completed_fallback_read_pages << '\n';
+    VDB_CHECK(m.left_fallback_pairs == 1 && m.completed_fallback_inner_scans == 3);
+    std::cout << "all-equal skew: 120x130=15600; fallback_pairs=1; Cblock=57; scans=3\n";
 }
 void FallbackRightAndStandalone() {
     const auto left = Rows(120, 7, true), right = Rows(150, 7);
     const auto m = Run(Wide(), Narrow(), left, right, 1, 0, 22000);
     VDB_CHECK(m.fallback_pairs == 1 && m.output_rows == 18000);
-    const auto p = GraceHashJoin::PartitionHash(7) % 2;
-    VDB_CHECK(m.pairs[p].side == PhysicalOuter::Right);
+    VDB_CHECK(m.right_fallback_pairs == 1);
     Files files;
     Database db(files.db, OpenMode::CreateNew, files.temp, 8);
     QueryContext q(db);
     SourceState a, b; a.allowed = 100;
     BlockNestedLoopJoin bnlj(q, {1, 0, PhysicalOuter::Right}, Child(q, Wide(), left, a),
-                            Child(q, Narrow(), right, b), 22000 - 384);
+                            Child(q, Narrow(), right, b), 22000 - 256);
     bnlj.Init();
     const auto actual = Drain(db, bnlj);
     VDB_CHECK(Canonical(bnlj.OutputSchema(), actual) == Reference(bnlj.OutputSchema(), left, right, 1, 0));
-    VDB_CHECK(bnlj.Memory().block_capacity == m.pairs[p].block_capacity);
-    VDB_CHECK(bnlj.Metrics().inner_scans == m.pairs[p].inner_scans);
+    VDB_CHECK(bnlj.Memory().block_capacity == (22000 - 256 - bnlj.Memory().scratch_bytes) / RowMemoryCharge(Narrow()));
+    VDB_CHECK(bnlj.Metrics().inner_scans == m.completed_fallback_inner_scans);
     q.FinishQuery(bnlj); Clean(db);
 }
 void RuntimeCap() {
@@ -384,7 +414,7 @@ void RuntimeCap() {
 }
 void ManyPartitionsAndMixedPairs() {
     auto m = Run(Narrow(), Narrow(), Rows(2, 7), Rows(3, 7), 0, 0, 1024 * 1024);
-    VDB_CHECK(m.pairs.size() == 64 && m.empty_pairs == 63 && m.hash_pairs == 1 && m.partition_write_pages == 2);
+    VDB_CHECK(m.peak_partition_writers == 64 && m.empty_pairs == 63 && m.hash_pairs == 1);
     std::vector<Tuple> left, right;
     for (size_t p = 0; p < 12; ++p) {
         const int64_t key = KeyFor(p, 12);
@@ -394,16 +424,15 @@ void ManyPartitionsAndMixedPairs() {
     }
     // Narrow/Narrow S=10008: M=63000 gives p=12 > F=8.
     m = Run(Narrow(), Narrow(), left, right, 0, 0, 63000);
-    VDB_CHECK(m.pairs.size() == 12 && m.hash_pairs == 12 && m.peak_partition_writers == 12);
+    VDB_CHECK(m.hash_pairs == 12 && m.peak_partition_writers == 12);
     VDB_CHECK(m.left_build_pairs > 0 && m.right_build_pairs > 0 && m.peak_build_rows == 7);
-    std::cout << "F=8 p=12: hash_pairs=12 peak_build_rows=7 partition_pages=" << m.partition_write_pages
-              << " peak_pins=" << maximum_pins << '\n';
+    std::cout << "F=8 p=12: hash_pairs=12 peak_build_rows=7 peak_pins=" << maximum_pins << '\n';
     left = Rows(2, KeyFor(0, 3)); right = Rows(3, KeyFor(0, 3));
     const auto large_left = Rows(90, KeyFor(1, 3)), large_right = Rows(95, KeyFor(1, 3));
     left.insert(left.end(), large_left.begin(), large_left.end());
     right.insert(right.end(), large_right.begin(), large_right.end());
     m = Run(Narrow(), Narrow(), left, right, 0, 0, 23300);
-    VDB_CHECK(m.pairs.size() == 3 && m.hash_pairs == 1 && m.fallback_pairs == 1 && m.empty_pairs == 1);
+    VDB_CHECK(m.peak_partition_writers == 3 && m.hash_pairs == 1 && m.fallback_pairs == 1 && m.empty_pairs == 1);
     VDB_CHECK(m.peak_build_rows == 2 && m.output_rows == 8556);
     std::cout << "mixed p=3: hash=1 fallback=1 empty=1 output=8556\n";
 }
@@ -473,7 +502,7 @@ void InvalidConfiguration() {
         Schema bad(SchemaKind::Intermediate, {{"bad", type, uint16_t(type == TypeId::Varchar ? 20 : 0), type == TypeId::Int64}});
         invalid(bad, Narrow(), 0, 0, 20000); invalid(Narrow(), bad, 0, 0, 20000);
     }
-    for (size_t bytes : {size_t{0}, size_t{1}, size_t{10007}, size_t{10008}, size_t{10009}, size_t{18455}, size_t{18839}})
+    for (size_t bytes : {size_t{0}, size_t{1}, size_t{10007}, size_t{10008}, size_t{10009}, size_t{18455}, size_t{18711}})
         invalid(Narrow(), Narrow(), 0, 0, bytes);
     GraceHashJoin enormous(q, {0, 0, std::numeric_limits<size_t>::max()},
         Child(q, Narrow(), rows, a), Child(q, Narrow(), rows, b));
@@ -490,7 +519,7 @@ void InvalidConfiguration() {
     Throws([&] { GraceHashJoin join(q, {0, 0}, Child(foreign, Narrow(), rows, a), Child(q, Narrow(), rows, b)); });
     GraceHashJoin defaulted(q, {0, 0}, Child(q, Narrow(), rows, a), Child(q, Narrow(), rows, b));
     VDB_CHECK(defaulted.Memory().max_bytes == 20000);
-    GraceHashJoin minimum(q, {0, 0, 18840}, Child(q, Narrow(), rows, a), Child(q, Narrow(), rows, b));
+    GraceHashJoin minimum(q, {0, 0, 18712}, Child(q, Narrow(), rows, a), Child(q, Narrow(), rows, b));
     VDB_CHECK(minimum.Memory().partition_count == 2);
     VDB_CHECK(minimum.Memory().fallback_memory - minimum.Memory().scratch_bytes == 8448);
     VDB_CHECK(minimum.Memory().left_block_capacity >= 1 && minimum.Memory().right_block_capacity >= 1);
@@ -514,7 +543,7 @@ void MaximumSchema() {
     for (size_t i = 0; i < 3; ++i) values.emplace_back(int64_t(i));
     const std::vector<Tuple> rows{Tuple(values)};
     // Maximum legal output T=4672, S=23232. p=2 minimum still leaves 8448 for a block.
-    const auto m = Run(schema, schema, rows, rows, 0, 0, 23232 + 2 * 4416);
+    const auto m = Run(schema, schema, rows, rows, 0, 0, 23232 + 2 * 4352);
     VDB_CHECK(m.hash_pairs == 1 && m.output_rows == 1);
     Schema payload(SchemaKind::Intermediate, {{"key", TypeId::Int64}, {"double", TypeId::Double, 0, true},
                                              {"text", TypeId::Varchar, 8, true}});
@@ -554,7 +583,7 @@ void TempLimits() {
     ExternalSort sort(q, {0, 24576}, std::move(join));
     Throws([&] { sort.Init(); }, "cap");
     VDB_CHECK(observed->Metrics().hash_pairs == 2 && observed->Metrics().output_rows > 4);
-    VDB_CHECK(observed->Metrics().completed_hash_read_pages == 3); // First pair fully released, second build read.
+    VDB_CHECK(observed->Metrics().peak_build_rows == 12 && observed->Metrics().fallback_pairs == 0);
     VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 5 && q.Temps().Metrics().peak_temp_extent_pages == 5);
     VDB_CHECK(!sort.Exhausted() && !q.Succeeded());
     GraceHashJoinTestAccess::Released(*observed);
