@@ -300,10 +300,10 @@ void JoinChoices() {
         auto p = ChoosePlan(q, Join(left, right));
         VDB_CHECK(p.plan.kind == expected);
         std::cout << "join " << left << '+' << right << " score=" << p.plan.subtree_cost.Score()
-                  << " " << p.plan.details << '\n';
-        if (p.plan.block_memory) std::cout << "C_block=" << p.plan.block_memory->block_capacity << '\n';
-        if (p.plan.grace_memory) {
-            const auto m = *p.plan.grace_memory;
+                  << "\n" << Explain(p) << '\n';
+        if (p.plan.kind == PlanKind::GHJ) {
+            const auto m = ComputeGraceJoinMemory(q.Resources(), p.plan.children[0].schema,
+                p.plan.children[1].schema, p.plan.schema, p.plan.memory_bytes);
             std::cout << "p=" << m.partition_count << " Dghj=" << m.descriptor_bytes
                       << " build=" << m.left_build_capacity << ',' << m.right_build_capacity << '\n';
             const auto* actual = dynamic_cast<GraceHashJoin*>(p.root.get());
@@ -312,7 +312,7 @@ void JoinChoices() {
             VDB_CHECK(actual->Memory().fallback_memory == m.fallback_memory);
             const auto& l = p.plan.children[0];
             const auto& r = p.plan.children[1];
-            Near(p.plan.local_cost.pages, 2 * (l.pages + r.pages));
+            Near(p.plan.local_cost.pages, 2 * (std::ceil(l.rows / 254) + std::ceil(r.rows / 254)));
             Near(p.plan.subtree_cost.pages, l.subtree_cost.pages + r.subtree_cost.pages + p.plan.local_cost.pages);
         }
         VDB_CHECK(Run(q, p).size() == db.Table(left).live_rows);
@@ -325,11 +325,13 @@ void JoinChoices() {
         o.join = JoinChoice::BNLJ;
         auto p = ChoosePlan(q, mirrored ? Join("wide", "narrow") : Join("narrow", "wide"), o);
         VDB_CHECK(p.plan.join.outer == (mirrored ? PhysicalOuter::Right : PhysicalOuter::Left));
-        VDB_CHECK(p.plan.block_memory->block_capacity == 29);
-        Near(p.plan.inner_executions, 2);
         auto* actual = dynamic_cast<BlockNestedLoopJoin*>(p.root.get());
         VDB_CHECK(actual && actual->Memory().block_capacity == 29);
-        std::cout << "wide-row BNLJ " << p.plan.details << " C=29 versus wide C=2\n";
+        VDB_CHECK(actual->Memory().max_bytes == p.plan.memory_bytes);
+        const auto& outer = p.plan.children[mirrored ? 1 : 0];
+        const auto& inner = p.plan.children[mirrored ? 0 : 1];
+        Near(p.plan.subtree_cost.pages, outer.subtree_cost.pages + 2 * inner.subtree_cost.pages);
+        std::cout << "wide-row BNLJ " << Explain(p) << " C=29 versus wide C=2\n";
         VDB_CHECK(Run(q, p).size() == 5);
     }
     // NLJ chooses the one-row side as outer even when it is logical Right.
@@ -360,13 +362,16 @@ void ReplayCosts() {
         const auto& inner = p.plan.children[1];
         VDB_CHECK(Find(inner, PlanKind::IndexScan));
         const long double replays = algorithm == JoinChoice::NLJ ? 40 : 7;
-        Near(p.plan.inner_executions, replays);
         Near(inner.subtree_cost.pages, 3);
         Near(p.plan.subtree_cost.pages, 1 + replays * 3);
         Near(p.plan.local_cost.pages, 0);
         Near(p.plan.local_cost.cpu, 40);
         Near(p.plan.subtree_cost.cpu, replays * inner.subtree_cost.cpu + p.plan.local_cost.cpu);
-        if (algorithm == JoinChoice::BNLJ) VDB_CHECK(p.plan.block_memory->block_capacity == 6);
+        if (algorithm == JoinChoice::BNLJ) {
+            auto* block = dynamic_cast<BlockNestedLoopJoin*>(p.root.get());
+            VDB_CHECK(block && block->Memory().block_capacity == 6);
+            VDB_CHECK(block->Memory().max_bytes == p.plan.memory_bytes);
+        }
         std::cout << "selected index inner replay=" << replays << "*3, subtree pages=" << p.plan.subtree_cost.pages << '\n';
         VDB_CHECK(Run(q, p).size() == 1);
     }
@@ -463,9 +468,9 @@ void AggregateChoices() {
         Near(p.plan.rows, 3);
         Near(p.plan.local_cost.pages, 0);
         Near(p.plan.subtree_cost.pages, p.plan.children[0].subtree_cost.pages);
-        VDB_CHECK(p.plan.aggregate_memory->hash_group_capacity == 117);
         auto* actual = dynamic_cast<HashAggregate*>(p.root.get());
         VDB_CHECK(actual && actual->Memory().hash_group_capacity == 117);
+        VDB_CHECK(actual->Memory().max_bytes == p.plan.memory_bytes);
         VDB_CHECK(Explain(p).find("predicted spill=no") != std::string::npos);
         std::cout << "HashAggregate groups=3 capacity=117 score=" << p.plan.subtree_cost.Score() << '\n';
         VDB_CHECK(Run(q, p).size() == 3);
@@ -475,16 +480,21 @@ void AggregateChoices() {
         QueryContext q(db, {32768, 4096});
         auto p = ChoosePlan(q, spec);
         VDB_CHECK(p.plan.kind == PlanKind::SortAggregate);
-        VDB_CHECK(p.plan.children[0].kind == PlanKind::ExternalSort);
-        VDB_CHECK(p.plan.children[0].sort_memory->max_bytes == p.plan.aggregate_memory->sort_memory_bytes);
+        VDB_CHECK(p.plan.children[0].kind == PlanKind::SeqScan);
+        VDB_CHECK(!Find(p.plan, PlanKind::ExternalSort));
+        Near(p.plan.local_cost.pages, 4 * std::ceil(1000.0L / 254));
+        Near(p.plan.local_cost.cpu, 1000 + 1000 * std::log2(1000.0L));
+        Near(p.plan.subtree_cost.pages, p.plan.children[0].subtree_cost.pages + p.plan.local_cost.pages);
         auto* actual = dynamic_cast<SortAggregate*>(p.root.get());
-        VDB_CHECK(actual && actual->Memory().sort_memory_bytes == p.plan.aggregate_memory->sort_memory_bytes);
+        VDB_CHECK(actual && actual->Memory().max_bytes == p.plan.memory_bytes);
+        VDB_CHECK(actual->Memory().sort_memory_bytes == 32768 - actual->Memory().combine_bytes);
         PlanOptions h;
         h.aggregate = AggregateChoice::HashAggregate;
         auto hash = ChoosePlan(q, spec, h);
         VDB_CHECK(hash.plan.kind == PlanKind::HashAggregate);
         VDB_CHECK(Explain(hash).find("predicted spill=yes") != std::string::npos);
         const long double partial_pages = std::ceil(1000.0L / 72);
+        Near(hash.plan.local_cost.cpu, 3000 + 1000 * std::log2(1000.0L));
         Near(hash.plan.local_cost.pages, 12 * partial_pages); // write/read partial + 10 sort temp passes.
         Near(hash.plan.subtree_cost.pages, hash.plan.children[0].subtree_cost.pages + hash.plan.local_cost.pages);
         std::cout << "high NDV: SortAggregate=" << p.plan.subtree_cost.Score()
@@ -539,7 +549,9 @@ void GlobalAndValidation() {
         auto p = ChoosePlan(q, spec);
         VDB_CHECK(p.plan.kind == PlanKind::GlobalAggregate);
         VDB_CHECK(!Find(p.plan, PlanKind::ExternalSort));
-        VDB_CHECK(p.plan.aggregate_memory->hash_group_capacity == 0);
+        const auto* actual = dynamic_cast<HashAggregate*>(p.root.get());
+        VDB_CHECK(actual && actual->Memory().hash_group_capacity == 0);
+        VDB_CHECK(actual->Memory().max_bytes == p.plan.memory_bytes);
         p.root->Init();
         Tuple row({});
         VDB_CHECK(p.root->Next(row) && row.value(0).as_int64() == 0);
@@ -596,7 +608,9 @@ void MemoryAndCost() {
         auto spec = Scan("one");
         spec.order_column = 0;
         auto p = ChoosePlan(q, spec);
-        VDB_CHECK(p.plan.sort_memory->run_capacity == 2 && p.plan.sort_memory->merge_fan_in == 0);
+        const auto* actual = dynamic_cast<ExternalSort*>(p.root.get());
+        VDB_CHECK(actual && actual->Memory().run_capacity == 2 && actual->Memory().merge_fan_in == 0);
+        VDB_CHECK(actual->Memory().max_bytes == p.plan.memory_bytes);
         VDB_CHECK(Run(q, p).size() == 1);
     }
     {
@@ -614,7 +628,9 @@ void MemoryAndCost() {
         PlanOptions o;
         o.aggregate = AggregateChoice::HashAggregate;
         auto p = ChoosePlan(q, spec, o);
-        VDB_CHECK(p.plan.aggregate_memory->hash_group_capacity == 1);
+        const auto* actual = dynamic_cast<HashAggregate*>(p.root.get());
+        VDB_CHECK(actual && actual->Memory().hash_group_capacity == 1);
+        VDB_CHECK(actual->Memory().max_bytes == p.plan.memory_bytes);
         VDB_CHECK(Run(q, p).size() == 1); // Exact bound proves spill cannot be needed.
     }
     for (size_t memory : {size_t{1}, size_t{10392}, size_t{10488}}) {
@@ -633,11 +649,10 @@ void MemoryAndCost() {
         auto spec = Scan("wide");
         spec.order_column = 0;
         auto p = ChoosePlan(q, spec);
-        const auto& m = *p.plan.sort_memory;
+        const auto m = ComputeSortMemory(q.Resources(), p.plan.schema, p.plan.memory_bytes);
         VDB_CHECK(m.run_capacity == 8 && m.merge_fan_in == 2 && m.descriptor_capacity == 32);
         Near(p.plan.local_cost.pages, 300);
         Near(p.plan.subtree_cost.pages, 330);
-        Near(p.plan.temp_pages, 150); // Initial + 4 intermediate levels, append-only.
         auto* actual = dynamic_cast<ExternalSort*>(p.root.get());
         VDB_CHECK(actual && actual->Memory().run_capacity == m.run_capacity);
         VDB_CHECK(actual->Memory().merge_fan_in == m.merge_fan_in);
@@ -698,6 +713,113 @@ void MemoryAndCost() {
     ModeledCost huge{1e30L, 1e38L};
     VDB_CHECK(std::isfinite(huge.Score()) && huge.Score() > 1e30L);
 }
+void PlanStructure() {
+    Files f;
+    Database db(f.db, OpenMode::CreateNew, f.temp, 8);
+    Fill(db, "t", 1000);
+    db.CreateIndex("t", 0);
+    db.Analyze("t");
+    auto spec = Scan("t");
+    spec.aggregate = AggregateSpec{0, std::nullopt, true};
+    spec.order_column = 0;
+    for (size_t bytes : {size_t{24576}, size_t{32768}}) {
+        QueryContext q(db, {1048576, 4096});
+        PlanOptions options;
+        options.left_scan = ScanChoice::SeqScan;
+        options.aggregate = AggregateChoice::SortAggregate;
+        options.aggregate_memory = bytes;
+        const auto fetches = db.Metrics().buffer_fetches;
+        const auto io = db.Disk().counters();
+        auto p = ChoosePlan(q, spec, options);
+        const auto explanation = Explain(p);
+        VDB_CHECK(p.plan.kind == PlanKind::SortAggregate && p.plan.children.size() == 1);
+        VDB_CHECK(p.plan.children[0].kind == PlanKind::SeqScan);
+        VDB_CHECK(p.plan.NeedsInternalSort() && !Find(p.plan, PlanKind::ExternalSort));
+        VDB_CHECK(p.plan.memory_bytes == bytes && p.elided_order_column == 0);
+        VDB_CHECK(explanation.find("internal_sort=yes") != std::string::npos);
+        VDB_CHECK(explanation.find("ExternalSort") == std::string::npos);
+        VDB_CHECK(explanation.find("Final Sort eliminated") != std::string::npos);
+        auto* aggregate = dynamic_cast<SortAggregate*>(p.root.get());
+        VDB_CHECK(aggregate && aggregate->Memory().max_bytes == bytes);
+        const size_t sort_bytes = bytes - aggregate->Memory().combine_bytes;
+        VDB_CHECK(aggregate->Memory().sort_memory_bytes == sort_bytes);
+
+        // A genuine ORDER BY over the same input must charge exactly the internal sort work.
+        auto sorted = Scan("t");
+        sorted.order_column = 0;
+        PlanOptions sort_options;
+        sort_options.left_scan = ScanChoice::SeqScan;
+        sort_options.sort_memory = sort_bytes;
+        auto explicit_sort = ChoosePlan(q, sorted, sort_options);
+        VDB_CHECK(explicit_sort.plan.kind == PlanKind::ExternalSort);
+        VDB_CHECK(explicit_sort.plan.children[0].kind == PlanKind::SeqScan);
+        VDB_CHECK(explicit_sort.plan.memory_bytes == sort_bytes);
+        Near(p.plan.local_cost.pages, explicit_sort.plan.local_cost.pages);
+        Near(p.plan.local_cost.cpu, 1000 + explicit_sort.plan.local_cost.cpu);
+        Near(p.plan.subtree_cost.pages, explicit_sort.plan.subtree_cost.pages);
+        Near(p.plan.subtree_cost.cpu, 1000 + explicit_sort.plan.subtree_cost.cpu);
+        // Independent multi-pass formula, including initial writes and streamed final reads.
+        const auto memory = ComputeSortMemory(q.Resources(), Narrow(), sort_bytes);
+        long double runs = std::ceil(1000.0L / memory.run_capacity);
+        size_t levels = 0;
+        while (runs > memory.merge_fan_in) { runs = std::ceil(runs / memory.merge_fan_in); ++levels; }
+        Near(p.plan.local_cost.pages, (2 * levels + 2) * std::ceil(1000.0L / 254));
+        Near(p.plan.subtree_cost.pages, db.Table("t").heap_pages + p.plan.local_cost.pages);
+        // Construction and explanation must not initialize any candidate, read pages, or allocate runs.
+        VDB_CHECK(aggregate->Metrics().input_rows == 0 && aggregate->Metrics().sort.initial_runs == 0);
+        VDB_CHECK(db.Metrics().buffer_fetches == fetches);
+        VDB_CHECK(db.Disk().counters().database_reads == io.database_reads);
+        VDB_CHECK(db.Disk().counters().temporary_reads == io.temporary_reads);
+        VDB_CHECK(db.Disk().counters().temporary_writes == io.temporary_writes);
+        VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 0);
+        VDB_CHECK(q.Temps().Metrics().temp_relations_created == 0);
+        for (size_t replay = 1; replay <= 2; ++replay) {
+            p.root->Init();
+            Tuple row({});
+            int64_t count = 0;
+            while (p.root->Next(row)) {
+                VDB_CHECK(row.value(0).as_int64() == count && row.value(1).as_int64() == 1);
+                ++count;
+            }
+            VDB_CHECK(count == 1000);
+            p.root->Close();
+            const auto& metrics = aggregate->Metrics();
+            VDB_CHECK(metrics.used_internal_sort && !metrics.input_order_reused);
+            VDB_CHECK(metrics.sort.initial_runs == size_t(std::ceil(1000.0L / memory.run_capacity)));
+            VDB_CHECK(metrics.sort.intermediate_merge_passes == levels);
+            VDB_CHECK(metrics.sort.modeled_peak_bytes <= sort_bytes);
+            // Each materialized run has one writer. A second sorter would add relations here.
+            VDB_CHECK(q.Temps().Metrics().temp_relations_created == replay * metrics.sort.materialized_runs);
+            VDB_CHECK(db.Metrics().active_pins == 0);
+        }
+        q.Close();
+        VDB_CHECK(q.Temps().Metrics().current_temp_extent_pages == 0);
+        VDB_CHECK(db.Disk().PageCount(FileKind::Temporary) == 0);
+    }
+    // Ordered input needs no sorter even after Filter/Projection; final projection can drop the key.
+    spec.left.predicates = {{0, CompareOp::GreaterEqual, 990}};
+    spec.left.projection = ProjectionPlan{{0}};
+    spec.projection = ProjectionPlan{{1}};
+    PlanOptions options;
+    options.left_scan = ScanChoice::IndexScan;
+    options.aggregate = AggregateChoice::SortAggregate;
+    options.aggregate_memory = 3000; // Enough for combine, not enough for a sorter.
+    QueryContext q(db);
+    auto p = ChoosePlan(q, spec, options);
+    const auto* aggregate = Find(p.plan, PlanKind::SortAggregate);
+    VDB_CHECK(aggregate && !aggregate->NeedsInternalSort());
+    VDB_CHECK(aggregate->children[0].kind == PlanKind::Projection);
+    VDB_CHECK(aggregate->children[0].children[0].kind == PlanKind::Filter);
+    VDB_CHECK(!Find(p.plan, PlanKind::ExternalSort));
+    Near(aggregate->local_cost.pages, 0);
+    Near(aggregate->local_cost.cpu, aggregate->children[0].rows);
+    VDB_CHECK(!p.plan.ordering.ordered && p.elided_order_column == 0);
+    VDB_CHECK(Explain(p).find("internal_sort=no") != std::string::npos);
+    VDB_CHECK(Explain(p).find("before final projection") != std::string::npos);
+    VDB_CHECK(Run(q, p).size() == 10);
+    VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 0);
+}
+
 void PipelineAndExplain() {
     Files f;
     Database db(f.db, OpenMode::CreateNew, f.temp, 8);
@@ -743,9 +865,9 @@ void PipelineAndExplain() {
         const auto* aggregate = Find(p.plan, PlanKind::HashAggregate);
         const auto* sort = Find(p.plan, PlanKind::ExternalSort);
         VDB_CHECK(join && aggregate && sort);
-        VDB_CHECK(join->grace_memory->max_bytes == 65536);
-        VDB_CHECK(aggregate->aggregate_memory->max_bytes == 32768);
-        VDB_CHECK(sort->sort_memory->max_bytes == 24576);
+        VDB_CHECK(join->memory_bytes == 65536);
+        VDB_CHECK(aggregate->memory_bytes == 32768);
+        VDB_CHECK(sort->memory_bytes == 24576);
         VDB_CHECK(!join->ordering.ordered && !aggregate->ordering.ordered);
         VDB_CHECK(Find(join->children[0], PlanKind::Filter) && Find(join->children[1], PlanKind::Filter));
         example = Explain(p);
@@ -780,7 +902,7 @@ int main(int argc, char** argv) {
         {"statistics", Statistics}, {"selectivity", Selectivity}, {"scans", ScanChoices},
         {"ordering", OrderAndProjection}, {"joins", JoinChoices}, {"replay_costs", ReplayCosts},
         {"forced_joins", ForcedJoins}, {"grace_fallback", GraceFallback}, {"aggregates", AggregateChoices}, {"validation", GlobalAndValidation},
-        {"memory_costs", MemoryAndCost}, {"pipeline_explain", PipelineAndExplain}};
+        {"memory_costs", MemoryAndCost}, {"plan_structure", PlanStructure}, {"pipeline_explain", PipelineAndExplain}};
     size_t passed = 0;
     try {
         for (const auto& [name, run] : cases) {

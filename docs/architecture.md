@@ -19,6 +19,16 @@ ValenceDB connects a page-oriented row store to owned-tuple executors and a smal
 
 From the bottom up, `DiskManager` transfers 4096-byte pages, `BufferPool` caches them, heap/catalog/index helpers interpret their explicit formats, and `Database` coordinates persistent mutation and clean reopen. Executors consume owned tuples; external algorithms use the same pool through staged temporary pages. `ChoosePlan` enumerates existing physical alternatives and constructs the winning executor tree without executing it. It and `Explain` are free functions, not an `Optimizer` class.
 
+The optimizer pipeline remains explicit: generate scans → enumerate joins and
+physical orientations → enumerate aggregates → apply required sort/projection →
+select the cheapest feasible complete plan → build executors. One tagged
+`PhysicalPlan` describes each actual operator and carries one resolved memory
+allowance when needed. Shared memory helpers derive capacities locally. A pure
+sort estimator charges explicit sorting, aggregate input sorting, and partial-state
+sorting without creating synthetic nodes. SortAggregate owns its internal sorter;
+its plan child is the real input, and its local cost includes the internal sort.
+EXPLAIN formats selected facts after planning rather than storing prose in candidates.
+
 ## Ownership and lifetimes
 
 ```text

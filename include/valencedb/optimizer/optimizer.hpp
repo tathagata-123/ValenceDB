@@ -37,18 +37,19 @@ struct ModeledCost {
 };
 enum class PlanKind { SeqScan, IndexScan, Filter, Projection, NLJ, BNLJ, GHJ,
                       GlobalAggregate, HashAggregate, SortAggregate, ExternalSort };
+enum class StatisticsSource { Heuristic, Sampled, Stale };
 // Small value descriptors only. Candidate comparison never initializes executors.
 struct PhysicalPlan {
     PlanKind kind;
     Schema schema;
     Ordering ordering;
     bool exact_rows = false;
-    long double rows = 0, row_upper_bound = 0, pages = 0, input_rows = 0;
+    long double rows = 0, row_upper_bound = 0;
     ModeledCost local_cost, subtree_cost;
-    long double temp_pages = 0, inner_executions = 0;
     std::vector<long double> ndv;
-    std::string confidence, details;
     std::vector<PhysicalPlan> children;
+    std::optional<size_t> memory_bytes; // Resolved allowance, also passed to the executor.
+    StatisticsSource statistics = StatisticsSource::Heuristic; // Snapshot on scan nodes only.
     SeqScanPlan seq;
     IndexScanPlan index{"", 0};
     std::optional<Int64Predicate> predicate;
@@ -56,11 +57,11 @@ struct PhysicalPlan {
     JoinPlan join{0, 0};
     AggregateSpec aggregate;
     size_t column = 0;
-    std::optional<BlockNestedLoopJoinMemory> block_memory;
-    std::optional<GraceHashJoinMemory> grace_memory;
-    std::optional<ExternalSortMemory> sort_memory;
-    std::optional<AggregateMemory> aggregate_memory;
     PhysicalPlan(PlanKind kind, Schema schema) : kind(kind), schema(std::move(schema)) {}
+    bool NeedsInternalSort() const {
+        return kind == PlanKind::SortAggregate && aggregate.group_column &&
+            children[0].ordering != Ordering{true, *aggregate.group_column};
+    }
 };
 struct OptimizedPlan {
     PhysicalPlan plan;
@@ -68,6 +69,8 @@ struct OptimizedPlan {
     QueryResources resources;
     size_t buffer_frames;
     std::vector<std::string> rejected;
+    PlanOptions options; // Explain forcing once, rather than storing prose on every candidate.
+    std::optional<size_t> elided_order_column; // ORDER BY position before final projection.
 };
 OptimizedPlan ChoosePlan(QueryContext&, const QuerySpec&, const PlanOptions& = {});
 std::string Explain(const OptimizedPlan&);

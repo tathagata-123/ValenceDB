@@ -246,6 +246,11 @@ Json PlanRecord(const PhysicalPlan& p, const Config& c) {
     j.Real("estimated_rows", static_cast<double>(p.rows));
     j.Real("estimated_local_pages", static_cast<double>(p.local_cost.pages));
     j.Real("estimated_subtree_pages", static_cast<double>(p.subtree_cost.pages));
+    j.Real("estimated_local_cpu", static_cast<double>(p.local_cost.cpu));
+    j.Real("estimated_subtree_cpu", static_cast<double>(p.subtree_cost.cpu));
+    j.Real("estimated_score", static_cast<double>(p.subtree_cost.Score()));
+    if (p.memory_bytes) j.Number("memory_bytes", *p.memory_bytes);
+    if (p.kind == PlanKind::SortAggregate) j.Bool("internal_sort", p.NeedsInternalSort());
     if (p.kind == PlanKind::SeqScan || p.kind == PlanKind::IndexScan) {
         const auto& table = p.kind == PlanKind::SeqScan ? p.seq.table : p.index.table;
         const auto requested = table == "right" ? c.right_scan : c.scan;
@@ -711,7 +716,7 @@ void Run(const Config& c, Json& record, std::string& stage) {
 
 int main(int argc, char** argv) {
     Config c; Json record; std::string stage = "cli";
-    record.Number("schema_version", 2); record.Bool("success", false);
+    record.Number("schema_version", 3); record.Bool("success", false);
     record.String("build_type", VALENCEDB_BENCH_BUILD_TYPE);
     record.String("compiler", VALENCEDB_BENCH_COMPILER);
     record.String("platform", VALENCEDB_BENCH_PLATFORM);

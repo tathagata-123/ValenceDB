@@ -119,7 +119,7 @@ At a high level:
                persistent file + scratch file
 ```
 
-`DiskManager` transfers physical pages. `BufferPool` caches them and mediates pin lifetimes through move-only guards. Heap, catalog, and B+ tree code interpret explicit on-disk formats. Executors exchange owned tuples, while external algorithms use query-scoped temporary relations through the same buffer pool. The planner estimates a small set of legal physical alternatives and constructs the selected executor tree without executing it.
+`DiskManager` transfers physical pages. `BufferPool` caches them and mediates pin lifetimes through move-only guards. Heap, catalog, and B+ tree code interpret explicit on-disk formats. Executors exchange owned tuples, while external algorithms use query-scoped temporary relations through the same buffer pool. The planner estimates a small set of legal physical alternatives and constructs the selected executor tree without executing it. Its tagged plan nodes retain real children and resolved memory allowances; internal aggregate sorting is costed through a shared estimator and constructed by the aggregate. EXPLAIN derives descriptions and capacities after selection. See the [Phase 4 implementation report](docs/phase4_refactor.md) for verification and the comparison with Phase 3.
 
 ## Documentation
 

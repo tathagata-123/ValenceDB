@@ -86,15 +86,15 @@ Insertion is also separate from read-query timing. An empty heap and empty index
 
 ## Structured schema and metrics
 
-Schema version 1 uses nested JSON objects; 64-bit hash accumulators are hex strings to avoid downstream floating-point loss. All integers represent counts/bytes unless named otherwise. Every successful record has:
+Schema version 3 uses nested JSON objects; 64-bit hash accumulators are hex strings to avoid downstream floating-point loss. All integers represent counts/bytes unless named otherwise. Every successful record has:
 
 | Field | Contents |
 |---|---|
 | `config` | Complete parsed configuration, defaults included, seed and trial |
 | `build_type`, `compiler`, `platform` | CMake build/compiler/OS/architecture; runner also records observed platform strings |
 | `dataset` | Actual rows, heap pages, schema columns, maximum encoded bytes, modeled T, index state/height, total database file pages |
-| `physical_plans`, `explain` | Executed descriptor tree, ordering/ring/outer, estimates, readable capacities and forcing markers |
-| `algorithm` | Concrete executor's runtime counters and local memory derivations; GHJ includes bounded per-partition records; aggregates include internal sort counters/capacities |
+| `physical_plans`, `explain` | Actual operator tree, ordering/ring/outer, estimates, resolved budgets, aggregate internal-sort property; EXPLAIN derives capacities and forcing markers |
+| `algorithm` | Concrete executor's runtime counters and local memory derivations; GHJ includes summary pair/orientation/fallback counters; aggregates include internal sort counters/capacities |
 | `elapsed_ms`, `timing_boundary`, `buffer_state` | Measured interval and exact state/boundary description |
 | `result_rows`, `diagnostic_digest`, `ordered_digest` | Consumed row count and explicit stable diagnostic hashes |
 | `reference_validation`, `order_verified`, `finish_query_succeeded` | Applicable validation/lifecycle evidence; page/insert experiments use the documented exceptions |
@@ -155,7 +155,7 @@ Single-threaded, single-process, one active query; no SQL frontend, transactions
 
 ## Phase 2 diagnostic schema
 
-New benchmark records use schema_version=2. Grace Join removes `pairs`,
+Phase 2 and Phase 3 benchmark records use schema_version=2. Grace Join removes `pairs`,
 `partition_write_pages`, `completed_hash_read_pages`, and
 `completed_fallback_read_pages`. These copied descriptor data or derived logical
 transfers, not physical file I/O. New summary fields `left_fallback_pairs`,
@@ -169,3 +169,29 @@ records can supply orientation and completed scan totals for successful runs.
 Removing the per-pair diagnostics changes the shared Grace memory formula to
 `p=min(64,(M-S)/(P+256))`, `Dghj=128*p`. This may change capacities or paths near
 boundaries; it does not change the per-operator budget or row charges.
+
+## Phase 4 schema version 3
+
+New records use `schema_version=3`; the runner requires version 3 and validates
+plan budgets and aggregate structure recursively. Existing version 2 evidence is
+preserved for comparison.
+
+- SortAggregate `children` now contains the actual input, removing the synthetic
+  ExternalSort. Its `estimated_local_pages` includes internal sorting; its subtree
+  estimate and algorithm remain equivalent. `internal_sort` explicitly records
+  whether input sorting is needed. A genuine final ExternalSort remains a node.
+- Each heavyweight plan reports its resolved `memory_bytes`. New cost fields are
+  `estimated_local_cpu`, `estimated_subtree_cpu`, and `estimated_score` (subtree
+  pages + 0.0001 × subtree CPU).
+- The human-readable `explain` string is generated from selected facts. It no
+  longer includes cumulative estimated scratch extent, cached narrative, or a
+  synthetic internal-sort hierarchy. Statistics source appears on scans, forcing
+  appears once at the top, and internal sorting is described on the aggregate.
+- Result digests, reference checks, physical I/O, buffer/scratch measurements,
+  algorithm metrics, and their meanings are unchanged from version 2. No runtime
+  counter was removed.
+
+To compare version 2 and 3 plan records, fold a SortAggregate's old synthetic
+sort into its local cost and replace that child with the sort's input. Compare
+subtree costs, actual algorithms, and execution counters independently; do not
+interpret the removed display node as removal of the sorting work.

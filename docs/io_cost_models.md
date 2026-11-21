@@ -49,7 +49,7 @@ Successful teardown closes executors and handles, rejects temporary pins, discar
 
 ## Algorithmic work and optimizer costs
 
-The existing specialized counters remain authoritative: sort initial/materialized runs, intermediate passes and streamed final fan-in; BNLJ blocks/scans/comparisons; GHJ partition-pair strategies/build peaks/failed-build rows; and aggregate group peaks/overflow flushes/spill batches/records/output groups. Their exact partial-execution boundaries are in [external_sort.md](external_sort.md), [joins.md](joins.md), and [aggregation.md](aggregation.md). `spill_batches` includes the final nonempty map flush. GHJ completed-page counters omit unfinished scans, with failed build-prefix rows exposed separately.
+The existing specialized counters remain authoritative: sort initial/materialized runs, intermediate passes and streamed final fan-in; BNLJ blocks/scans/comparisons; GHJ partition-pair strategies/build peaks/failed-build rows; and aggregate group peaks/overflow flushes/spill batches/records/output groups. Their exact partial-execution boundaries are in [external_sort.md](external_sort.md), [joins.md](joins.md), and [aggregation.md](aggregation.md). `spill_batches` includes the final nonempty map flush. GHJ fallback inner-scan totals include completed pairs only, with failed build-prefix rows exposed separately.
 
 The optimizer's `ModeledCost` uses logical pages plus `0.0001 * cpu`, not cache misses or elapsed time. Let N be estimated packed pages, r initial runs, k fan-in, and L materialized intermediate levels (repeated ceil(r/k) reductions until r<=k). Local/subtree accounting is:
 
@@ -61,7 +61,9 @@ The optimizer's `ModeledCost` uses logical pages plus `0.0001 * cpu`, not cache 
 | ExternalSort | Child once + initial writes, intermediate read/write levels, final streamed reads: local `(2L+2)N` when external; no final output write |
 | HashAggregate, fit | Child once + local hash CPU |
 | HashAggregate, spill | Child once + partial writes + partial TempScan reads + reduced-budget partial ExternalSort work + combine CPU |
-| SortAggregate | Ordered child once + group CPU; otherwise internal reduced-budget ExternalSort subtree once + group CPU |
+| SortAggregate | Actual child once + group CPU + internal reduced-budget sort work only when input is unordered |
+
+SortAggregate local cost includes internal sorting; there is no synthetic sort child. The shared pure sort estimator excludes its input path. Hash partial generation and TempScan reads are charged by the aggregate separately from partial-sort work. Derived capacities and replay counts are formatted on demand, and the planner no longer accumulates diagnostic temporary-extent totals. Runtime scratch metrics and limits are unchanged.
 
 An indexed/filter/project inner is charged at its selected subtree execution cost, not replaced with raw table pages. Adding all displayed children once to an NLJ/BNLJ subtree would misrepresent replay. A final projection does not add page work. [optimizer.md](optimizer.md) gives exact estimates and feasibility formulas.
 

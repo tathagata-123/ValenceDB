@@ -84,12 +84,30 @@ def cases(suite):
     return result
 
 
+def validate_plan(plan):
+    required = {"operator", "ordered", "estimated_rows", "estimated_local_pages",
+                "estimated_subtree_pages", "estimated_local_cpu", "estimated_subtree_cpu",
+                "estimated_score", "children"}
+    if required - plan.keys():
+        raise ValueError("missing physical plan fields: " + str(required - plan.keys()))
+    if plan["operator"] in ("BNLJ", "GHJ", "GlobalAggregate", "HashAggregate", "SortAggregate", "ExternalSort"):
+        if plan.get("memory_bytes", 0) <= 0:
+            raise ValueError("missing resolved operator budget")
+    if plan["operator"] == "SortAggregate":
+        if not isinstance(plan.get("internal_sort"), bool) or len(plan["children"]) != 1:
+            raise ValueError("invalid SortAggregate input/property")
+        if plan["children"][0]["operator"] == "ExternalSort":
+            raise ValueError("unexpected synthetic aggregate sort child")
+    for child in plan["children"]:
+        validate_plan(child)
+
+
 def validate(record):
     required = {"schema_version", "config", "success", "build_type", "compiler", "platform",
                 "failure_stage", "failure_reason"}
     if required - record.keys():
         raise ValueError("missing record fields: " + str(required - record.keys()))
-    if record["schema_version"] != 2:
+    if record["schema_version"] != 3:
         raise ValueError("unsupported schema")
     if not record["success"]:
         return
@@ -115,6 +133,8 @@ def validate(record):
     if s["allocated_temp_pages"] != f["temporary_allocations"]:
         raise ValueError("scratch/file allocation mismatch")
     c = record["config"]
+    for plan in record["physical_plans"]:
+        validate_plan(plan)
     if c["family"] not in ("clock", "btree_insert") and record["finish_query_succeeded"] is not True:
         raise ValueError("query did not finish")
     if c["reference"] and not record["reference_validation"].startswith(("exact canonical", "every fetched")):
@@ -245,7 +265,7 @@ def main():
                         raise ValueError("exit status disagrees with record")
                 except (subprocess.TimeoutExpired, ValueError, OSError, KeyError, TypeError) as error:
                     failure = str(error)
-                    record = dict(schema_version=2, config=options, success=False,
+                    record = dict(schema_version=3, config=options, success=False,
                                   failure_stage="runner_validation", failure_reason=failure)
                 record.update(suite=args.suite, case_id=case["case_id"], equivalence_group=case["equivalence_group"],
                               command=command, runner_platform=platform.platform(), runner_architecture=platform.machine())
