@@ -7,7 +7,7 @@ ValenceDB reports algorithmic work, buffer activity, and file operations separat
 - `BufferPool::metrics()` (also `Database::Metrics()`) starts at pool construction and accumulates through queries and checked database close. Reopening constructs a new pool. `active_pins` is a current gauge; `peak_pins` is a lifetime high-water mark.
 - `DiskManager::counters()` starts at DiskManager construction. Scratch reset does not reset these counters. Reopening creates new counters.
 - `QueryContext::Temps().Metrics()` starts with each context. Successful page allocations and writer constructions remain historical after cleanup. Current extent is read from DiskManager and becomes zero only after successful scratch reset.
-- Operator `Metrics()` resets at each `Init()` that starts an execution and survives `Close()`. Rejected duplicate Init does not reset the live execution. Aggregate internal-sort metrics are snapshots after sort Init and at aggregate Close.
+- Operator `Metrics()` resets at each `Init()` that starts an execution and survives `Close()`. Rejected duplicate Init does not reset the live execution. Aggregate internal-sort metrics are snapshots after successful sort Init; sorting counters are fixed during streamed output.
 
 Accessors return const references to live counters. Copy the small struct for a stable snapshot; subtract cumulative counters for interval work. Do not subtract peaks to infer an interval peak. There is no global reset or generic telemetry registry.
 
@@ -67,4 +67,4 @@ SortAggregate local cost includes internal sorting; there is no synthetic sort c
 
 An indexed/filter/project inner is charged at its selected subtree execution cost, not replaced with raw table pages. Adding all displayed children once to an NLJ/BNLJ subtree would misrepresent replay. A final projection does not add page work. [optimizer.md](optimizer.md) gives exact estimates and feasibility formulas.
 
-Costs assume clean completion and approximate packing. Allocation/initialization, cache effects, partition/run tail waste, skew fallback and abandoned build/retry work can differ from these ideal estimates. For GHJ fallback, replace that pair's hash read with outer pages plus block-count times inner pages; any failed build prefix is extra. No reclamation cost is subtracted when descriptors die. Statistics affect choices only; fresh, stale and forced plans retain the same executable predicates.
+Costs assume clean completion and approximate packing. Allocation/initialization, cache effects, partition/run tail waste, skew fallback and failed operations can differ from these ideal estimates. For GHJ fallback, replace that pair's hash read with outer pages plus block-count times inner pages; metadata disagreement fails the query instead of retrying a build. No reclamation cost is subtracted when descriptors die. Statistics affect choices only; fresh, stale and forced plans retain the same executable predicates.

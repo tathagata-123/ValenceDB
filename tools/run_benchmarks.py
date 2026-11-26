@@ -107,7 +107,7 @@ def validate(record):
                 "failure_stage", "failure_reason"}
     if required - record.keys():
         raise ValueError("missing record fields: " + str(required - record.keys()))
-    if record["schema_version"] != 5:
+    if record["schema_version"] != 6:
         raise ValueError("unsupported schema")
     if not record["success"]:
         return
@@ -153,7 +153,7 @@ def validate(record):
                 raise ValueError("index order was not reused")
         if c["aggregate"] == "sort" and c["scan"] == "seq" and not a["used_internal_sort"]:
             raise ValueError("unordered grouping did not sort")
-        if a["spill_batches"] and a["spill_batches"] != a["overflow_flushes"] + 1:
+        if a["spill_batches"] == 1:
             raise ValueError("spill final flush count mismatch")
 
 
@@ -188,9 +188,9 @@ def check_groups(records, selected):
                   and r["config"]["aggregate"] == "hash"}
         if hashes["aggregate_few_hash_seq"]["algorithm"]["spill_batches"] != 0:
             raise ValueError("few-groups fixture spilled")
-        if hashes["aggregate_spill_hash_seq"]["algorithm"]["overflow_flushes"] < 2:
+        if hashes["aggregate_spill_hash_seq"]["algorithm"]["spill_batches"] < 3:
             raise ValueError("repeated-spill fixture did not spill repeatedly")
-        if hashes["aggregate_uneven_avg_hash_seq"]["algorithm"]["overflow_flushes"] < 1:
+        if hashes["aggregate_uneven_avg_hash_seq"]["algorithm"]["spill_batches"] < 2:
             raise ValueError("uneven AVG fixture did not spill")
 
 
@@ -265,7 +265,7 @@ def main():
                         raise ValueError("exit status disagrees with record")
                 except (subprocess.TimeoutExpired, ValueError, OSError, KeyError, TypeError) as error:
                     failure = str(error)
-                    record = dict(schema_version=5, config=options, success=False,
+                    record = dict(schema_version=6, config=options, success=False,
                                   failure_stage="runner_validation", failure_reason=failure)
                 record.update(suite=args.suite, case_id=case["case_id"], equivalence_group=case["equivalence_group"],
                               command=command, runner_platform=platform.platform(), runner_architecture=platform.machine())

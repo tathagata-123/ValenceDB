@@ -11,7 +11,7 @@ struct JoinPlan {
     PhysicalOuter outer = PhysicalOuter::Left;
 };
 struct NestedLoopJoinMetrics {
-    size_t outer_rows = 0, inner_scans = 0, candidate_comparisons = 0, output_rows = 0;
+    size_t inner_scans = 0, candidate_comparisons = 0, output_rows = 0;
 };
 
 // The physical inner must support the Close -> Init replay contract.

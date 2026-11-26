@@ -202,10 +202,17 @@ void PersistentPipeline() {
     }
     {
         QueryContext q(db);
+        IndexScan index(q, IndexScanPlan{"l", 0});
+        auto fetches = db.Metrics().buffer_fetches;
+        index.Init();
+        const auto init_fetches = db.Metrics().buffer_fetches - fetches;
+        index.Close();
         SortAggregate a(q, AggregateSpec{0, {}, true},
             std::make_unique<IndexScan>(q, IndexScanPlan{"l", 0}), 4096);
+        fetches = db.Metrics().buffer_fetches;
         a.Init();
-        VDB_CHECK(a.Metrics().input_rows == 0); // Ordered initialization streams lazily.
+        // Only the index's initial descent; aggregation does not consume rows.
+        VDB_CHECK(db.Metrics().buffer_fetches - fetches == init_fetches);
         std::map<int64_t, int64_t> counts;
         for (const auto& r : left) if (r.live) ++counts[r.row.value(0).as_int64()];
         Encoded expected;
@@ -287,9 +294,15 @@ void PartitionedGroupPipeline() {
     db.CreateTable("l", left); db.CreateTable("r", right);
     // Separate join partitions deliberately repeat every grouping key with uneven contributions.
     const int64_t copies[] = {1, 2, 5}, measures[] = {10, 100, -5};
+    const auto partition_of = [](int64_t key) {
+        uint64_t h = static_cast<uint64_t>(key) + UINT64_C(0x9e3779b97f4a7c15);
+        h = (h ^ (h >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+        h = (h ^ (h >> 27)) * UINT64_C(0x94d049bb133111eb);
+        return (h ^ (h >> 31)) % 3;
+    };
     for (size_t partition = 0; partition < 3; ++partition) {
         int64_t key = 0;
-        while (GraceHashJoin::PartitionHash(key) % 3 != partition) ++key;
+        while (partition_of(key) != partition) ++key;
         for (int64_t group = 0; group < 180; ++group)
             db.Insert("l", Tuple({Value(group - 90), Value(key), Value(group + measures[partition])}));
         for (int64_t copy = 0; copy < copies[partition]; ++copy)
@@ -313,9 +326,8 @@ void PartitionedGroupPipeline() {
         VDB_CHECK(gh->Metrics().fallback_pairs == 0 && gh->Metrics().output_rows == 1440);
         VDB_CHECK(l.inits == 1 && r.inits == 1 && l.rows == 540 && r.rows == 8);
         VDB_CHECK(l.calls == 541 && r.calls == 9);
-        VDB_CHECK(ha->Metrics().input_rows == 1440 && ha->Metrics().spill_records > 180);
-        VDB_CHECK(ha->Metrics().overflow_flushes >= 2);
-        VDB_CHECK(ha->Metrics().spill_batches == ha->Metrics().overflow_flushes + 1);
+        VDB_CHECK(ha->Metrics().spill_records > 180);
+        VDB_CHECK(ha->Metrics().spill_batches >= 3);
         VDB_CHECK(ha->Metrics().peak_hash_groups == ha->Memory().hash_group_capacity);
         VDB_CHECK(ha->Metrics().used_internal_sort && ha->Metrics().sort.final_merge_streamed);
         VDB_CHECK(es->Metrics().initial_runs > 1 && es->Metrics().final_merge_streamed);

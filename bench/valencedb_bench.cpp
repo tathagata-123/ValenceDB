@@ -296,8 +296,7 @@ void SortMemory(Json& j, const ExternalSortMemory& m) {
 void SortMetrics(Json& j, const ExternalSortMetrics& m) {
 #define SM(field) j.Number(#field, m.field)
     SM(initial_runs); SM(materialized_runs); SM(intermediate_merge_passes); SM(final_merge_fan_in);
-    SM(peak_retained_rows); SM(peak_run_descriptors); SM(peak_merge_heads); SM(modeled_peak_bytes);
-    SM(pending_boundary_tuples);
+    SM(peak_retained_rows);
 #undef SM
     j.Bool("final_merge_streamed", m.final_merge_streamed);
 }
@@ -307,18 +306,18 @@ Json Algorithm(Executor& root, const Schema& input, const QueryResources& resour
         SortMemory(j, e->Memory()); SortMetrics(j, e->Metrics());
     } else if (auto* e = dynamic_cast<NestedLoopJoin*>(&root)) {
         const auto& m = e->Metrics();
-        j.Number("outer_rows", m.outer_rows); j.Number("inner_scans", m.inner_scans);
+        j.Number("inner_scans", m.inner_scans);
         j.Number("candidate_comparisons", m.candidate_comparisons); j.Number("output_rows", m.output_rows);
-        Require(m.output_rows == count && m.inner_scans == m.outer_rows, "NLJ counter mismatch");
+        Require(m.output_rows == count, "NLJ counter mismatch");
     } else if (auto* e = dynamic_cast<BlockNestedLoopJoin*>(&root)) {
         const auto& m = e->Metrics(); const auto& b = e->Memory();
         j.Number("M", b.max_bytes); j.Number("Touter", b.outer_row_bytes);
         j.Number("S", b.scratch_bytes); j.Number("C_block", b.block_capacity);
 #define BM(field) j.Number(#field, m.field)
-        BM(outer_rows); BM(outer_blocks); BM(inner_scans); BM(candidate_comparisons); BM(output_rows);
-        BM(peak_block_rows); BM(modeled_peak_bytes); BM(pending_boundary_tuples);
+        BM(inner_scans); BM(candidate_comparisons); BM(output_rows);
+        BM(peak_block_rows);
 #undef BM
-        Require(m.inner_scans == m.outer_blocks && m.output_rows == count, "BNLJ counter mismatch");
+        Require(m.output_rows == count, "BNLJ counter mismatch");
     } else if (auto* e = dynamic_cast<GraceHashJoin*>(&root)) {
         const auto& m = e->Metrics(); const auto& b = e->Memory();
         j.Number("M", b.max_bytes); j.Number("Tleft", b.left_row_bytes); j.Number("Tright", b.right_row_bytes);
@@ -328,7 +327,7 @@ Json Algorithm(Executor& root, const Schema& input, const QueryResources& resour
         j.Number("right_block_capacity", b.right_block_capacity);
 #define GM(field) j.Number(#field, m.field)
         GM(hash_pairs); GM(fallback_pairs); GM(empty_pairs); GM(left_build_pairs); GM(right_build_pairs);
-        GM(peak_build_rows); GM(modeled_peak_build_bytes); GM(output_rows); GM(peak_partition_writers);
+        GM(peak_build_rows); GM(output_rows); GM(peak_partition_writers);
         GM(left_fallback_pairs); GM(right_fallback_pairs); GM(completed_fallback_inner_scans);
 #undef GM
         Require(m.output_rows == count, "GHJ counter mismatch");
@@ -343,7 +342,7 @@ Json Algorithm(Executor& root, const Schema& input, const QueryResources& resour
             j.Number("combine_bytes", b->combine_bytes); j.Number("group_capacity", b->hash_group_capacity);
             j.Number("internal_sort_M", b->sort_memory_bytes);
 #define AM(field) j.Number(#field, m->field)
-            AM(input_rows); AM(peak_hash_groups); AM(modeled_peak_hash_bytes); AM(overflow_flushes);
+            AM(peak_hash_groups);
             AM(spill_batches); AM(spill_records); AM(output_groups);
 #undef AM
             j.Bool("used_internal_sort", m->used_internal_sort); j.Bool("input_order_reused", m->input_order_reused);
@@ -352,7 +351,6 @@ Json Algorithm(Executor& root, const Schema& input, const QueryResources& resour
                 SortMemory(sort, ComputeSortMemory(resources, hash ? AggregatePartialSchema() : input, b->sort_memory_bytes));
             j.Object("sort", sort);
             Require(m->output_groups == count, "aggregate counter mismatch");
-            Require(!m->spill_batches || m->spill_batches == m->overflow_flushes + 1, "final spill flush missing");
         }
     }
     return j;
@@ -713,7 +711,7 @@ void Run(const Config& c, Json& record, std::string& stage) {
 
 int main(int argc, char** argv) {
     Config c; Json record; std::string stage = "cli";
-    record.Number("schema_version", 5); record.Bool("success", false);
+    record.Number("schema_version", 6); record.Bool("success", false);
     record.String("build_type", VALENCEDB_BENCH_BUILD_TYPE);
     record.String("compiler", VALENCEDB_BENCH_COMPILER);
     record.String("platform", VALENCEDB_BENCH_PLATFORM);

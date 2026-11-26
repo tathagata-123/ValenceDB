@@ -19,7 +19,7 @@ GraceHashJoinMemory ComputeGraceJoinMemory(const QueryResources&, const Schema& 
 struct GraceHashJoinMetrics {
     size_t hash_pairs = 0, fallback_pairs = 0, empty_pairs = 0;
     size_t left_build_pairs = 0, right_build_pairs = 0;
-    size_t peak_build_rows = 0, modeled_peak_build_bytes = 0, output_rows = 0;
+    size_t peak_build_rows = 0, output_rows = 0;
     size_t peak_partition_writers = 0;
     size_t left_fallback_pairs = 0, right_fallback_pairs = 0;
     size_t completed_fallback_inner_scans = 0; // Actual BNLJ scans, counted at pair EOF.
@@ -34,13 +34,11 @@ public:
     Ordering OutputOrdering() const override { return {}; }
     const GraceHashJoinMemory& Memory() const noexcept { return memory_; }
     const GraceHashJoinMetrics& Metrics() const noexcept { return metrics_; }
-    static uint64_t PartitionHash(int64_t key) noexcept;
 private:
     void DoInit() override;
     bool DoNext(Tuple& out) override;
     void DoClose() noexcept override;
-    friend struct GraceHashJoinTestAccess; // Exercises the otherwise unreachable runtime cap.
-    enum class Phase { Closed, SelectPair, Probe, Fallback, Done };
+    enum class Phase { SelectPair, Probe, Fallback };
     struct BuildHash { size_t operator()(int64_t key) const noexcept; };
     using Table = std::unordered_multimap<int64_t, Tuple, BuildHash>;
     using Partitions = std::vector<TempRun>;
@@ -50,7 +48,7 @@ private:
     const Schema schema_, left_schema_, right_schema_; // Outlive all borrowed temp schemas.
     GraceHashJoinMemory memory_{};
     GraceHashJoinMetrics metrics_;
-    Phase phase_ = Phase::Closed;
+    Phase phase_ = Phase::SelectPair;
     Partitions left_parts_, right_parts_;
     size_t pair_ = 0;
     PhysicalOuter build_side_ = PhysicalOuter::Left;
@@ -62,7 +60,8 @@ private:
 
     void Partition(Executor& child, const Schema& schema, size_t key, Partitions& parts);
     bool SelectPair();
-    bool Build(size_t capacity);
+    void Build();
+    bool Probe(Tuple& out);
     void BeginFallback();
     void ReleasePair() noexcept;
 };

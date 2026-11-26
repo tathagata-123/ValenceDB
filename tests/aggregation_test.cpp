@@ -209,13 +209,14 @@ AggregateMetrics Run(Database& db, const std::vector<Tuple>& rows, AggregateSpec
     auto result = Drain(*a);
     CheckResult(*a, result, rows, spec);
     const auto metrics = hash ? static_cast<HashAggregate&>(*a).Metrics() : static_cast<SortAggregate&>(*a).Metrics();
-    VDB_CHECK(metrics.input_rows == rows.size() && metrics.output_groups == result.size());
+    VDB_CHECK(metrics.output_groups == result.size());
     VDB_CHECK(source.inits == 1 && source.delivered == rows.size() && source.calls == rows.size() + 1);
     VDB_CHECK(a->OutputOrdering() == (hash || !spec.group_column ? Ordering{} : Ordering{true, 0}));
     if (hash) {
         auto& h = static_cast<HashAggregate&>(*a);
         VDB_CHECK(metrics.peak_hash_groups <= h.Memory().hash_group_capacity);
-        VDB_CHECK(metrics.modeled_peak_hash_bytes <= h.Memory().max_bytes);
+        VDB_CHECK(!spec.group_column || h.Memory().scratch_bytes +
+            h.Memory().hash_group_capacity * kAggregateGroupCharge <= h.Memory().max_bytes);
     }
     if (!spec.group_column) {
         VDB_CHECK(metrics.peak_hash_groups == 0 && !metrics.used_internal_sort);
@@ -235,6 +236,7 @@ void Semantics() {
         if (!grouped) spec.group_column.reset();
         for (bool hash : {true, false}) {
             Run(db, {}, spec, hash);
+            Run(db, {Row(4, -7)}, spec, hash);
             Run(db, rows, spec, hash);
         }
     }
@@ -274,7 +276,6 @@ void Capacity() {
         CheckResult(a, got, rows, All());
         VDB_CHECK(a.Metrics().peak_hash_groups == std::min(cap, groups));
         VDB_CHECK(a.Metrics().spill_batches == (offset > 0 ? 2 : 0));
-        VDB_CHECK(a.Metrics().overflow_flushes == (offset > 0 ? 1 : 0));
         VDB_CHECK(a.Metrics().spill_records == (offset > 0 ? groups : 0));
         VDB_CHECK(a.Metrics().used_internal_sort == (offset > 0));
         VDB_CHECK(state.inits == 1 && state.delivered == rows.size());
@@ -310,7 +311,7 @@ void MultiSpill() {
     rows.push_back(Row(1000, -2));
     a.Init();
     AggregateTestAccess::HashPhase(a);
-    VDB_CHECK(a.Metrics().overflow_flushes == 3 && a.Metrics().spill_batches == 4);
+    VDB_CHECK(a.Metrics().spill_batches == 4);
     VDB_CHECK(a.Metrics().spill_records == 3 * cap + 4);
     VDB_CHECK(a.Metrics().sort.initial_runs > 2 && a.Metrics().sort.intermediate_merge_passes > 1);
     VDB_CHECK(a.Metrics().sort.final_merge_streamed);
@@ -328,8 +329,8 @@ void MultiSpill() {
     }
     const auto& m = a.Metrics();
     std::cout << "spill evidence M=" << a.Memory().max_bytes << " S=" << a.Memory().scratch_bytes
-        << " cap=" << cap << " peak=" << m.peak_hash_groups << " modeled=" << m.modeled_peak_hash_bytes
-        << " overflow=" << m.overflow_flushes << " batches=" << m.spill_batches << " records=" << m.spill_records
+        << " cap=" << cap << " peak=" << m.peak_hash_groups
+        << " batches=" << m.spill_batches << " records=" << m.spill_records
         << " groups=" << m.output_groups << " runs=" << m.sort.initial_runs
         << " passes=" << m.sort.intermediate_merge_passes << " temp=" << q.Temps().Metrics().allocated_temp_pages
         << " avg=83\n";
@@ -813,7 +814,7 @@ void ScaleWidth() {
         for (size_t i = 0; i < 20 * cap + 1; ++i) rows.push_back(Row(static_cast<int64_t>(i), -2));
         a.Init();
         CheckResult(a, Drain(a), rows, All());
-        VDB_CHECK(a.Metrics().overflow_flushes == 20 && a.Metrics().spill_batches == 21);
+        VDB_CHECK(a.Metrics().spill_batches == 21);
         VDB_CHECK(a.Metrics().spill_records == rows.size() && a.Metrics().peak_hash_groups == cap);
         VDB_CHECK(source.inits == 1 && source.delivered == rows.size());
         std::cout << "scale M=65536 cap=" << cap << " batches=" << a.Metrics().spill_batches

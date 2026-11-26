@@ -2,7 +2,6 @@
 #include "valencedb/execution/temp_scan.hpp"
 #include "valencedb/common/error.hpp"
 #include <algorithm>
-#include <cassert>
 #include <limits>
 
 namespace valencedb {
@@ -59,11 +58,10 @@ AggregateState ReadPartial(const Tuple& row) {
     return {row.value(1).as_int64(), row.value(2).as_int64(), row.value(3).as_int64(),
             row.value(4).as_int64(), row.value(5).as_int64() != 0};
 }
-AggregateState ConsumeGlobal(Executor& child, const AggregateSpec& spec, AggregateMetrics& metrics) {
+AggregateState ConsumeGlobal(Executor& child, const AggregateSpec& spec) {
     AggregateState state;
     Tuple row({});
     while (child.Next(row)) {
-        ++metrics.input_rows;
         state.Update(Measure(row, spec), spec);
     }
     child.Close();
@@ -71,15 +69,12 @@ AggregateState ConsumeGlobal(Executor& child, const AggregateSpec& spec, Aggrega
 }
 // Two concrete uses: raw ordered rows, or ordered partial states. One boundary row survives.
 bool NextGroup(Executor& input, const AggregateSpec& spec, bool partials,
-               std::optional<Tuple>& lookahead, AggregateMetrics& metrics, Tuple& out) {
+               std::optional<Tuple>& lookahead, Tuple& out) {
     Tuple row({});
     if (lookahead) {
         row = std::move(*lookahead);
         lookahead.reset();
-    } else {
-        if (!input.Next(row)) return false;
-        if (!partials) ++metrics.input_rows;
-    }
+    } else if (!input.Next(row)) return false;
     const size_t column = partials ? 0 : *spec.group_column;
     const int64_t key = row.value(column).as_int64();
     AggregateState state;
@@ -87,7 +82,6 @@ bool NextGroup(Executor& input, const AggregateSpec& spec, bool partials,
         if (partials) state.Combine(ReadPartial(row), spec);
         else state.Update(Measure(row, spec), spec);
         if (!input.Next(row)) break;
-        if (!partials) ++metrics.input_rows;
         if (row.value(column).as_int64() != key) {
             lookahead = std::move(row);
             break;
@@ -122,40 +116,33 @@ HashAggregate::HashAggregate(QueryContext& context, AggregateSpec spec,
           spec.group_column.has_value(), bytes)) {}
 
 std::optional<TempRun> HashAggregate::BuildGroups() {
-    auto groups = std::make_unique<Table>();
-    groups->max_load_factor(1.0f);
-    groups->reserve(memory_.hash_group_capacity);
+    table_ = std::make_unique<Table>();
+    auto& groups = *table_;
+    groups.reserve(memory_.hash_group_capacity);
     std::unique_ptr<TempWriter> writer;
-    metrics_.modeled_peak_hash_bytes = CheckedAdd(memory_.scratch_bytes,
-        CheckedMultiply(memory_.hash_group_capacity, kAggregateGroupCharge));
     Tuple row({}); // Owns the triggering row throughout the flush; never refetch it.
     while (child_->Next(row)) {
-        ++metrics_.input_rows;
         const int64_t key = row.value(*spec_.group_column).as_int64();
-        auto found = groups->find(key);
-        if (found == groups->end()) {
-            if (groups->size() == memory_.hash_group_capacity) {
+        auto found = groups.find(key);
+        if (found == groups.end()) {
+            if (groups.size() == memory_.hash_group_capacity) {
                 if (!writer) writer = std::make_unique<TempWriter>(context_.Temps(), partial_schema_);
-                FlushBatch(*groups, *writer);
-                ++metrics_.overflow_flushes;
+                FlushBatch(groups, *writer);
             }
-            found = groups->emplace(key, AggregateState{}).first;
-            metrics_.peak_hash_groups = std::max(metrics_.peak_hash_groups, groups->size());
+            found = groups.emplace(key, AggregateState{}).first;
+            metrics_.peak_hash_groups = std::max(metrics_.peak_hash_groups, groups.size());
         }
         found->second.Update(Measure(row, spec_), spec_);
-        assert(groups->size() <= memory_.hash_group_capacity);
     }
     child_->Close();
-    if (!writer) {
-        table_ = std::move(groups); // Retain only the table needed for output iteration.
-        return std::nullopt;
-    }
-    FlushBatch(*groups, *writer);
-    return writer->Finish(); // Locals destroy the writer page, map buckets, and input row.
+    if (!writer) return std::nullopt; // Emit the retained table directly.
+    FlushBatch(groups, *writer);
+    auto run = writer->Finish();
+    table_.reset(); // Release nodes and buckets before sorting partials.
+    return run;
 }
 
 void HashAggregate::FlushBatch(Table& groups, TempWriter& writer) {
-    if (groups.empty()) return;
     for (const auto& [key, state] : groups) {
         writer.Append(Tuple({Value(key), Value(state.count), Value(state.sum),
             Value(state.min), Value(state.max), Value(int64_t{state.has_value})}));
@@ -170,7 +157,7 @@ void HashAggregate::DoInit() {
     global_ = {};
     child_->Init();
     if (!spec_.group_column) {
-        global_ = ConsumeGlobal(*child_, spec_, metrics_);
+        global_ = ConsumeGlobal(*child_, spec_);
         phase_ = Phase::EmitGlobal;
         return;
     }
@@ -181,7 +168,6 @@ void HashAggregate::DoInit() {
         return;
     }
     // BuildGroups has released all build allocations before sorting starts.
-    assert(!table_);
     // TempScan owns a staging page outside ExternalSort's reduced budget.
     sort_ = std::make_unique<ExternalSort>(context_, ExternalSortPlan{0, memory_.sort_memory_bytes},
         std::make_unique<TempScan>(context_, *partials));
@@ -198,11 +184,9 @@ bool HashAggregate::DoNext(Tuple& out) {
     } else if (phase_ == Phase::EmitHash && position_ != table_->cend()) {
         out = Finalize(position_->first, position_->second, spec_);
         ++position_;
-    } else if (phase_ == Phase::CombinePartials &&
-               NextGroup(*sort_, spec_, true, lookahead_, metrics_, out)) {
-        // One combined output only; the boundary partial remains in lookahead_.
+    } else if (phase_ == Phase::CombinePartials) {
+        if (!NextGroup(*sort_, spec_, true, lookahead_, out)) return false;
     } else {
-        phase_ = Phase::Done;
         return false;
     }
     ++metrics_.output_groups;
@@ -211,13 +195,12 @@ bool HashAggregate::DoNext(Tuple& out) {
 
 void HashAggregate::DoClose() noexcept {
     child_->Close();
-    if (sort_) metrics_.sort = sort_->Metrics();
     sort_.reset(); // Destroys TempScan and its reader.
     position_ = Table::const_iterator{};
     table_.reset();
     lookahead_.reset();
     global_ = {};
-    phase_ = Phase::Closed;
+    phase_ = Phase::Done;
 }
 
 SortAggregate::SortAggregate(QueryContext& context, AggregateSpec spec,
@@ -245,9 +228,9 @@ void SortAggregate::DoInit() {
 bool SortAggregate::DoNext(Tuple& out) {
     if (!spec_.group_column) {
         if (global_emitted_) return false;
-        out = Finalize(0, ConsumeGlobal(*input_, spec_, metrics_), spec_);
+        out = Finalize(0, ConsumeGlobal(*input_, spec_), spec_);
         global_emitted_ = true;
-    } else if (!NextGroup(*input_, spec_, false, lookahead_, metrics_, out)) {
+    } else if (!NextGroup(*input_, spec_, false, lookahead_, out)) {
         return false;
     }
     ++metrics_.output_groups;
@@ -256,7 +239,6 @@ bool SortAggregate::DoNext(Tuple& out) {
 
 void SortAggregate::DoClose() noexcept {
     input_->Close(); // Keep the sorter/child tree for legal whole-execution replay.
-    if (metrics_.used_internal_sort) metrics_.sort = static_cast<ExternalSort&>(*input_).Metrics();
     lookahead_.reset();
     global_emitted_ = false;
 }

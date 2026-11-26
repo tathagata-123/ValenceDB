@@ -56,7 +56,7 @@ k = min(64, floor(A / (P+Tinput+128)))
 
 Addition and multiplication are checked, and subtraction follows reserve validation. Vector size representability is checked before allocation. Merge fan-in must be at least two **when a second run is needed**; a single private run can succeed with k=0 or k=1. A configuration satisfying M >= 4P can still fail for a wide Schema. Maximum supported rows (16 columns, 2048 encoded bytes) have T=4672 and S=23232, already above 4P without descriptors.
 
-S covers fixed control state, two staging-page allowances, and current/pending/output tuples. Each merge input additionally charges a private reader page, one decoded head, and 128 bytes of cursor/heap metadata. These are conservative educational charges, not measurements of object sizeof, allocator overhead, or RSS.
+S covers fixed control state, two staging-page allowances, and input/lookahead/output tuples. Each merge input additionally charges a private reader page, one decoded head, and 128 bytes of cursor/heap metadata. These are conservative educational charges, not measurements of object sizeof, allocator overhead, or RSS.
 
 `ExternalSort::Memory()` exposes these derived values as `ExternalSortMemory`: `max_bytes`, `row_bytes`, `scratch_bytes`, `descriptor_capacity`, `descriptor_bytes`, `run_capacity`, and `merge_fan_in`.
 
@@ -69,15 +69,19 @@ Representative three-column Schema: INT64 id, VARCHAR(256) payload, INT64 key; m
 | 131,072 | 128 | 16,384 | 143 | 20 |
 | 1,048,576 (default) | 1,024 | 131,072 | 1,258 | 64 |
 
-## Bounded run generation and the pending tuple
+## Bounded run generation and first-run lookahead
 
-Reserve C_sort tuple slots once. Child tuples are owned. Fill the chunk without ever pushing beyond C_sort, then fetch one boundary tuple to distinguish exactly-full EOF from another run. When a full chunk is followed by a tuple, move that tuple into **one pending Tuple**, charged to S. Sort and spill the chunk, clear its elements, then start the next chunk by moving in pending. There is no child rewind or duplicate fetch at any boundary.
+Reserve C_sort tuple slots once. Fill and sort a bounded chunk. Only for the
+first chunk, fetch one lookahead tuple to distinguish an exactly-full private
+run from a spilling sort. If it exists, spill the chunk and move that tuple into
+the next chunk. Later chunks fill only while space remains, then sort and spill;
+there is no boundary fetch, pending flag, or child rewind.
 
 At exact capacity followed by EOF, the sorted chunk stays private and no empty run is fabricated. Empty input has zero runs/pages; one row needs no temporary pages. If the boundary tuple proves multiple runs are necessary but k<2, reject immediately. No short actual VARCHAR payload can increase C_sort: worst-case schema charge always governs capacity.
 
 Sorting uses signed `as_int64()` comparisons with `<`, never serialized bytes or subtraction. Equal keys compare false in both directions. There is no tie RID, deduplication, or stability promise. One bounded std::sort is the intended algorithm.
 
-Before each spill, check current run count < D. Create a local TempWriter borrowing the immutable schema, append the sorted tuples, and push the sealed value returned by Finish into vector<TempRun>. There is no per-run heap allocation, schema copy, page-ID list, or stable-address requirement. Debug builds assert chunk sortedness; tests independently decode all materialized run chains, including obsolete runs.
+Before each spill, check current run count < D. Create a local TempWriter borrowing the immutable schema, append the sorted tuples, and push the sealed value returned by Finish into vector<TempRun>. There is no per-run heap allocation, schema copy, page-ID list, or stable-address requirement. Tests independently decode all materialized run chains, including obsolete runs.
 
 If the next initial run exceeds D, fail explicitly. No descriptor override is needed for tests: at M=24576, C_sort=14 and D=24, 337 rows exceed the cap. This finite input-run limit is intentional; generation does not merge early to bypass it.
 
@@ -89,7 +93,7 @@ Each merge group has at most k TempReaders and one decoded head per nonempty rea
 
 Readers use the existing private staging images: briefly fetch through BufferPool, copy page, release the guard, then decode rows. No sort state owns PageGuard. Fan-in depends on M, independently of F. Tests merge **11 readers with F=8**, observing peak pins=1.
 
-While current run count > k, partition current descriptors into groups of up to k. Merge each multi-run group through a writer into a completed TempRun in the next array. A singleton group carries its descriptor forward without page I/O. Destroy each group’s readers and writer before processing the next group. At pass end, clear current and swap the two arrays. There is no collection per historical merge level.
+While current run count > k, partition current descriptors into groups of up to k. Merge each multi-run group through a writer into a completed TempRun in the next array. A singleton group carries its descriptor forward without page I/O. Destroy each group’s readers and writer before processing the next group. At pass end, clear current and swap the two arrays. With k>=2 every pass strictly reduces the run count; later descriptor arrays cannot exceed the initial count, so only initial spills need a descriptor-limit check. There is no collection per historical merge level.
 
 Once run count <= k, open readers and initialize the final heap; **do not create a final writer or relation**. Every Next performs one merge step directly into the parent's output. No output buffer grows with result size. Empty final heap means EOF. The private path instead moves successive rows from its bounded sorted chunk.
 
@@ -121,13 +125,9 @@ The 309-row full-width fixture cumulatively allocates **107 pages**. A separate 
 | intermediate_merge_passes | Completed materialized levels only; excludes final streamed merge |
 | final_merge_fan_in | Actual number of final readers, zero on the private path |
 | final_merge_streamed | Final external reader/heap state was successfully initialized |
-| pending_boundary_tuples | Total boundary tuples retained one at a time, not simultaneous count |
 | peak_retained_rows | Maximum normal chunk rows or merge heads; fixed scratch tuples excluded |
-| peak_run_descriptors | Maximum size of either bounded descriptor vector |
-| peak_merge_heads | Maximum heap heads, always <= k |
-| modeled_peak_bytes | Maximum S+R plus C_sort*Tinput or merge inputs*(P+Tinput+128) |
 
-The generation charge is `C_sort*Tinput`, even for a short chunk, because its vector capacity is reserved. The phases reuse M. No value claims actual RSS. TempStore's `allocated_temp_pages` and `temp_relations_created` remain cumulative query metrics. Existing DiskManager counters expose physical file-page reads/writes and allocation initialization operations; BufferPool counters expose fetches/hits/misses/evictions/pins. There is no new generic metric framework or claim that these layers are interchangeable.
+Modeled phase bounds are computed from Memory(): `S+R+C_sort*Tinput` for generation and `S+R+k*(P+128+Tinput)` for merge. The generation charge is `C_sort*Tinput`, even for a short chunk, because its vector capacity is reserved. The phases reuse M. No value claims actual RSS. TempStore's `allocated_temp_pages` and `temp_relations_created` remain cumulative query metrics. Existing DiskManager counters expose physical file-page reads/writes and allocation initialization operations; BufferPool counters expose fetches/hits/misses/evictions/pins. There is no new generic metric framework or claim that these layers are interchangeable.
 
 ## Idealized page-data-pass model
 
@@ -141,14 +141,14 @@ These are data-pass formulas, not measured file I/O equations. Every physical al
 
 ## Invariants, verification, and limits
 
-Every sealed run and final output is ascending by signed key. Normal retained rows <= C_sort; at most one pending boundary tuple exists. Each descriptor vector <= D. Each active input has at most one head, heap size <= active readers <= k. No temporary guard survives a call. Generation capacity is destroyed before merging, and group reader/writer capacity is destroyed between groups. Duplicates and complete payload bytes survive exactly. The complete final result is never materialized, and released scratch pages remain allocated until query end.
+Every sealed run and final output is ascending by signed key. Normal retained rows <= C_sort; only the first-run optimization retains a lookahead tuple. Each descriptor vector <= D. Each active input has at most one head, heap size <= active readers <= k. No temporary guard survives a call. Generation capacity is destroyed before merging, and group reader/writer capacity is destroyed between groups. Duplicates and complete payload bytes survive exactly. The complete final result is never materialized, and released scratch pages remain allocated until query end.
 
-Tests cover private/empty/single/exact-capacity paths, pending rows with a nonrewindable child, signed extremes, identical duplicates, arbitrary VARCHAR bytes including NULs, maximum-width rows, nullable non-key payloads, independent sorted-run inspection, unique-key exact oracle order, multiset equality, fixed-seed randomized stress, multiple merge levels, minimum fan-in and descriptor failures, early Close/destruction/replay, cumulative/merge-time temp limits, injected child/write/read failures, pipeline metadata, and zero pins.
+Tests cover private/empty/single/exact-capacity paths, run boundaries with a nonrewindable child, signed extremes, identical duplicates, arbitrary VARCHAR bytes including NULs, maximum-width rows, nullable non-key payloads, independent sorted-run inspection, unique-key exact oracle order, multiset equality, fixed-seed randomized stress, multiple merge levels, minimum fan-in and descriptor failures, early Close/destruction/replay, cumulative/merge-time temp limits, injected child/write/read failures, pipeline metadata, and zero pins.
 
 Bounded chunks plus std::sort keep generation straightforward and expose the memory/run-count tradeoff directly. Replacement selection would add a second substantial algorithm and more state under the 8,000-core-line budget; it is deliberately excluded. Other limits: one ascending INT64 key, no NULL key ordering, no stable tie order, no parallel sorting, finite run-descriptor cap, append-only scratch, and educational modeled memory rather than exact RSS. Nested-loop joins and [Grace Hash Join](joins.md) use the same temporary-storage and memory model. ExternalSort(GHJ(...)) uses independent local allowances and a shared cumulative scratch cap; [Aggregation](aggregation.md) also reuses this sorter for partial states and unordered raw input. [Optimizer selection](optimizer.md) shares these capacity formulas and models the streamed final merge.
 
 ## Source and self-check
 
-The concrete state machine is [external_sort.cpp](../src/execution/external_sort.cpp): `ComputeSortMemory`, `GenerateRuns`, `SpillRun`, `MergePasses`, `OpenMerge`, `PullMerge`, and `CloseMerge`. Each initial chunk takes O(c log c) comparisons; across n input rows generation is O(n log C_sort). Each merged row costs O(log k) heap work per merge level. These are CPU bounds; the pass formulas above describe logical page transfers. Output remains streaming even if its volume exceeds M.
+The concrete state machine is [external_sort.cpp](../src/execution/external_sort.cpp): `GenerateRuns`, `SpillRun`, `MergePasses`, `OpenMerge`, `PullMerge`, and `CloseMerge`. The shared capacity formula is ComputeSortMemory in [work_budget.cpp](../src/execution/work_budget.cpp). Each initial chunk takes O(c log c) comparisons; across n input rows generation is O(n log C_sort). Each merged row costs O(log k) heap work per merge level. These are CPU bounds; the pass formulas above describe logical page transfers. Output remains streaming even if its volume exceeds M.
 
 The external-sort tests include explicit boundary handoff, multi-pass merge, retained-capacity, descriptor-cap, and temporary-page-limit cases; the benchmark suite exercises memory and frame-count sweeps.

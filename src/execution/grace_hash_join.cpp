@@ -1,6 +1,7 @@
 #include "valencedb/execution/grace_hash_join.hpp"
 #include "valencedb/execution/temp_scan.hpp"
 #include "join_helpers.hpp"
+#include "valencedb/common/error.hpp"
 #include <algorithm>
 #include <cassert>
 
@@ -14,11 +15,12 @@ uint64_t Mix(uint64_t value) noexcept {
 size_t Blocks(size_t rows, size_t capacity) {
     return rows / capacity + (rows % capacity != 0); // No rounding-add overflow.
 }
-}  // namespace
-
-uint64_t GraceHashJoin::PartitionHash(int64_t key) noexcept {
+uint64_t PartitionHash(int64_t key) noexcept {
     return Mix(static_cast<uint64_t>(key) + UINT64_C(0x9e3779b97f4a7c15));
 }
+}  // namespace
+
+// A different seed avoids reusing the partition hash for table buckets.
 size_t GraceHashJoin::BuildHash::operator()(int64_t key) const noexcept {
     return static_cast<size_t>(Mix(static_cast<uint64_t>(key) + UINT64_C(0xd1b54a32d192ed03)));
 }
@@ -59,38 +61,30 @@ void GraceHashJoin::DoInit() {
     phase_ = Phase::SelectPair;
 }
 
-bool GraceHashJoin::Build(size_t capacity) {
+void GraceHashJoin::Build() {
     const bool left = build_side_ == PhysicalOuter::Left;
     const auto& run = left ? left_parts_[pair_] : right_parts_[pair_];
     table_ = std::make_unique<Table>();
-    table_->max_load_factor(1.0f);
-    // Reserve only the known rows, bounded by the explicit capacity, including on defensive tests.
-    const size_t reserved_rows = std::min(run.RowCount(), capacity);
-    table_->reserve(reserved_rows);
-    metrics_.modeled_peak_build_bytes = std::max(metrics_.modeled_peak_build_bytes,
-        CheckedAdd(CheckedAdd(memory_.scratch_bytes, memory_.descriptor_bytes),
-            CheckedMultiply(reserved_rows, HashBuildRowCharge(run.OutputSchema()))));
+    table_->reserve(run.RowCount()); // SelectPair already established that this fits.
     {
         TempReader reader(run);
         Tuple row({});
         while (reader.Next(row)) {
-            if (table_->size() >= capacity) {
-                reader.Close();
-                table_.reset(); // Nodes AND buckets die before fallback is constructed.
-                return false;
-            }
+            if (table_->size() == run.RowCount())
+                throw DbError("Grace build row count disagrees with partition metadata");
             const int64_t key = row.value(left ? plan_.left_key : plan_.right_key).as_int64();
             table_->emplace(key, std::move(row));
             metrics_.peak_build_rows = std::max(metrics_.peak_build_rows, table_->size());
         }
     } // Build reader and its page are destroyed before opening probe.
+    if (table_->size() != run.RowCount())
+        throw DbError("Grace build row count disagrees with partition metadata");
     probe_ = std::make_unique<TempReader>(left ? right_parts_[pair_] : left_parts_[pair_]);
     match_ = match_end_ = table_->cend();
     ++metrics_.hash_pairs;
     if (left) ++metrics_.left_build_pairs;
     else ++metrics_.right_build_pairs;
     phase_ = Phase::Probe;
-    return true;
 }
 
 void GraceHashJoin::BeginFallback() {
@@ -130,12 +124,11 @@ bool GraceHashJoin::SelectPair() {
         const size_t build_rows = left ? l.RowCount() : r.RowCount();
         if (build_rows > capacity) {
             BeginFallback();
-        } else if (!Build(capacity)) {
-            BeginFallback(); // A defensive runtime cap check abandoned the entire table.
+        } else {
+            Build();
         }
         return true;
     }
-    phase_ = Phase::Done;
     return false;
 }
 
@@ -162,18 +155,21 @@ bool GraceHashJoin::DoNext(Tuple& out) {
             ReleasePair();
             continue;
         }
-        assert(phase_ == Phase::Probe);
+        if (Probe(out)) return true;
+        ReleasePair();
+    }
+}
+
+bool GraceHashJoin::Probe(Tuple& out) {
+    assert(phase_ == Phase::Probe);
+    for (;;) {
         if (match_ != match_end_) {
             out = detail::JoinedTuple(match_->second, probe_row_, build_side_);
             ++match_;
             ++metrics_.output_rows;
             return true;
         }
-        probe_row_ = Tuple({});
-        if (!probe_->Next(probe_row_)) {
-            ReleasePair();
-            continue;
-        }
+        if (!probe_->Next(probe_row_)) return false;
         const size_t key = build_side_ == PhysicalOuter::Left ? plan_.right_key : plan_.left_key;
         const auto range = table_->equal_range(probe_row_.value(key).as_int64());
         match_ = range.first;
@@ -192,7 +188,7 @@ void GraceHashJoin::DoClose() noexcept {
     left_->Close();
     right_->Close();
     pair_ = 0;
-    phase_ = Phase::Closed;
+    phase_ = Phase::SelectPair;
 }
 
 }  // namespace valencedb

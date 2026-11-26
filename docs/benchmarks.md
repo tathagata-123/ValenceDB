@@ -86,7 +86,7 @@ Insertion is also separate from read-query timing. An empty heap and empty index
 
 ## Structured schema and metrics
 
-Schema version 5 uses nested JSON objects; 64-bit hash accumulators are hex strings to avoid downstream floating-point loss. All integers represent counts/bytes unless named otherwise. Every successful record has:
+Schema version 6 uses nested JSON objects; 64-bit hash accumulators are hex strings to avoid downstream floating-point loss. All integers represent counts/bytes unless named otherwise. Every successful record has:
 
 | Field | Contents |
 |---|---|
@@ -106,7 +106,7 @@ Schema version 5 uses nested JSON objects; 64-bit hash accumulators are hex stri
 
 `order_verified` is present on query records and means advertised ordering was checked, not that unordered operators promise order. Some family-specific keys are intentionally absent when inapplicable. Failures always retain schema/configuration/outcome/stage/reason; subprocess/parse errors are marked `runner_validation` and may lack executable metadata. The runner returns nonzero for any unexpected failure or suite-equivalence error and excludes failures from successful medians. It reparses every saved line, checks required fields/digest format/counters/cleanup, verifies family-specific boundary fixtures, compares equivalence groups, and checks ordered digests where order is fully defined. The selected case matrix determines family coverage and exact expected record count.
 
-BufferPool and DiskManager expose cumulative counters. The harness **copies** both immediately before measured work and subtracts cumulative counters afterward, excluding setup, reopen, cache preparation and prior runs. No peak is subtracted: `peak_pins` explicitly covers the reopened pool lifetime, including metadata preload, and `peak_pins_at_start` is supplied. There is no resettable interval pin-peak API. Algorithm metrics reset at Init and are read after FinishQuery/Close; aggregate Close captures final internal-sort counters. TempMetrics is copied for the query totals. A successful query checks zero physical scratch extent, zero pins, and no Temporary cache mappings afterward.
+BufferPool and DiskManager expose cumulative counters. The harness **copies** both immediately before measured work and subtracts cumulative counters afterward, excluding setup, reopen, cache preparation and prior runs. No peak is subtracted: `peak_pins` explicitly covers the reopened pool lifetime, including metadata preload, and `peak_pins_at_start` is supplied. There is no resettable interval pin-peak API. Algorithm metrics reset at Init and are read after FinishQuery/Close; aggregate Init captures internal-sort counters after the sort is initialized. TempMetrics is copied for the query totals. A successful query checks zero physical scratch extent, zero pins, and no Temporary cache mappings afterward.
 
 Keep these layers distinct:
 
@@ -137,7 +137,7 @@ All-equal cardinality is checked before execution with checked multiplication an
 
 GHJ consumes both children once, writes partitions, then build/probes bounded pairs. Ideal normal-case packed traffic is `3*(N_R+N_S)`, or more precisely original child input + partition writes + completed partition reads. Fragmentation and empty pairs change this. Oversized skew pairs deliberately use bounded BNLJ over the materialized partitions; substitute that pair's BNLJ rescan model for its hash reads. There is no recursive repartitioning. Full duplicate multiplicity and potentially quadratic output are preserved; fallback is an intended algorithm path, not a defect.
 
-**Aggregation.** Fitting HashAggregate makes one raw input pass plus expected hash CPU. Spilling adds writes of partial-state records, ExternalSort over those partials, and combination; it does not replay raw input. Spill batches include the final nonempty map flush, so `spill_batches=overflow_flushes+1` after spilling. SortAggregate uses small adjacent-group state once input is ordered, reuses genuine IndexScan ordering, and otherwise incurs ExternalSort over raw input. The fixtures vary group cardinality, rows, widths, measures and M, including repeated groups across batches, no-spill, COUNT(*) and unequal AVG batch sizes. Checked arithmetic order-dependence on canceling-overflow inputs is outside these successful comparisons.
+**Aggregation.** Fitting HashAggregate makes one raw input pass plus expected hash CPU. Spilling adds writes of partial-state records, ExternalSort over those partials, and combination; it does not replay raw input. Spill batches include the final nonempty map flush, so successful spilling produces at least two batches. SortAggregate uses small adjacent-group state once input is ordered, reuses genuine IndexScan ordering, and otherwise incurs ExternalSort over raw input. The fixtures vary group cardinality, rows, widths, measures and M, including repeated groups across batches, no-spill, COUNT(*) and unequal AVG batch sizes. Checked arithmetic order-dependence on canceling-overflow inputs is outside these successful comparisons.
 
 ## Add or repeat an experiment
 
@@ -230,10 +230,22 @@ access, and cross-component output equivalence without deletion.
 
 ## V1 Phase 3 schema version 5
 
-The runner now requires `schema_version=5`. Query scratch records remove redundant
+Phase 3 records used `schema_version=5`. Query scratch records remove redundant
 `extent_before_reset_sum` and `peak_extent_pages`. Retained `allocated_temp_pages`
 counts successful TempStore NewPage returns; successful-query comparison with
 DiskManager allocations remains valid. Failure paths no longer repair this count.
 Current physical extent, pins, and cache mappings are still checked after cleanup.
 GHJ drops `failed_build_rows`; build peaks, partition strategies, fallback counts,
 completed fallback scans, and outputs remain. Old records are historical evidence.
+
+
+## V1 Phase 4 schema version 6
+
+The runner now requires `schema_version=6`. Algorithm records omit redundant
+outer row/block counters, boundary handoffs, descriptor/head peaks, modeled
+byte peaks, aggregate input counts and overflow-flush counts. Scan/comparison
+work, output cardinality, occupancy, partition strategies, spill batches/records,
+merge passes and physical I/O remain. Memory bounds can be calculated from the
+published capacities. Historical records retain their original schema; compare
+common fields across versions. See [the Phase 4 report](v1_phase4_refactor.md)
+for the complete field list and contract changes.

@@ -27,8 +27,8 @@ AggregateMemory ComputeHashAggregateMemory(const QueryResources&, const Schema& 
 AggregateMemory ComputeSortAggregateMemory(const QueryResources&, const Schema& input,
     const Schema& output, bool needs_sort, std::optional<size_t> bytes = std::nullopt);
 struct AggregateMetrics {
-    size_t input_rows = 0, peak_hash_groups = 0, modeled_peak_hash_bytes = 0;
-    size_t overflow_flushes = 0, spill_batches = 0, spill_records = 0, output_groups = 0;
+    size_t peak_hash_groups = 0;
+    size_t spill_batches = 0, spill_records = 0, output_groups = 0;
     bool used_internal_sort = false, input_order_reused = false;
     ExternalSortMetrics sort;
 };
@@ -47,14 +47,14 @@ private:
     bool DoNext(Tuple& out) override;
     void DoClose() noexcept override;
     friend struct AggregateTestAccess;
-    enum class Phase { Closed, EmitGlobal, EmitHash, CombinePartials, Done };
+    enum class Phase { EmitGlobal, EmitHash, CombinePartials, Done };
     using Table = std::unordered_map<int64_t, AggregateState>;
     AggregateSpec spec_;
     std::unique_ptr<Executor> child_;
     const Schema schema_, partial_schema_; // Outlive every borrowed temp descriptor.
     AggregateMemory memory_;
     AggregateMetrics metrics_;
-    Phase phase_ = Phase::Closed;
+    Phase phase_ = Phase::Done;
     AggregateState global_;
     std::unique_ptr<Table> table_;
     Table::const_iterator position_{};

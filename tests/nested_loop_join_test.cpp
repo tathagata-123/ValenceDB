@@ -167,15 +167,13 @@ void CheckMetrics(Executor& join, bool block, size_t outer, size_t inner, size_t
         const auto& m = b.Memory();
         const auto& s = b.Metrics();
         const size_t blocks = outer / m.block_capacity + (outer % m.block_capacity != 0);
-        VDB_CHECK(s.outer_rows == outer && s.outer_blocks == blocks && s.inner_scans == blocks);
+        VDB_CHECK(s.inner_scans == blocks);
         VDB_CHECK(s.candidate_comparisons == outer * inner && s.output_rows == outputs);
         VDB_CHECK(s.peak_block_rows == std::min(outer, m.block_capacity));
-        VDB_CHECK(s.pending_boundary_tuples == (blocks ? blocks - 1 : 0));
-        VDB_CHECK(s.modeled_peak_bytes == m.scratch_bytes + m.block_capacity * m.outer_row_bytes);
-        VDB_CHECK(s.modeled_peak_bytes <= m.max_bytes);
+        VDB_CHECK(m.scratch_bytes + m.block_capacity * m.outer_row_bytes <= m.max_bytes);
     } else {
         const auto& s = dynamic_cast<NestedLoopJoin&>(join).Metrics();
-        VDB_CHECK(s.outer_rows == outer && s.inner_scans == outer);
+        VDB_CHECK(s.inner_scans == outer);
         VDB_CHECK(s.candidate_comparisons == outer * inner && s.output_rows == outputs);
     }
 }
@@ -212,8 +210,7 @@ Bag Run(Database& db, bool block, PhysicalOuter side, const std::vector<Tuple>& 
             const auto& b = dynamic_cast<BlockNestedLoopJoin&>(*join);
             const auto& m = b.Memory();
             std::cout << " M=" << m.max_bytes << " S=" << m.scratch_bytes << " Touter=" << m.outer_row_bytes
-                      << " C=" << m.block_capacity << " blocks=" << b.Metrics().outer_blocks
-                      << " pending=" << b.Metrics().pending_boundary_tuples;
+                      << " C=" << m.block_capacity << " blocks=" << b.Metrics().inner_scans;
         }
         std::cout << " outer_rows=" << on << " scans=" << scans << " comparisons=" << on * in
                   << " outputs=" << result.size() << '\n';
@@ -286,10 +283,10 @@ void BlockBoundaries() {
     Clean(db, files); db.Close();
 }
 
-void ResumeAndPending() {
+void ResumeWithoutLookahead() {
     Files files;
     Database db(files.db, OpenMode::CreateNew, files.temp, 8);
-    const std::vector<Tuple> left{L(7, "A"), L(7, "B"), L(7, "C"), L(7, "PENDING"), L(7, "E")};
+    const std::vector<Tuple> left{L(7, "A"), L(7, "B"), L(7, "C"), L(7, "D"), L(7, "E")};
     const std::vector<Tuple> right{R(7, 0), R(7, 1), R(7, 2), R(7, 3), R(7, 4)};
     for (bool block : {false, true}) for (auto side : sides) {
         QueryContext q(db);
@@ -305,11 +302,12 @@ void ResumeAndPending() {
         for (size_t i = 0; i < 3; ++i) {
             VDB_CHECK(join->Next(row)); output.push_back(row); Pins(db);
             VDB_CHECK(is.inits == 1);
-            VDB_CHECK(os.delivered == (block ? 4 : 1));
+            VDB_CHECK(os.delivered == (block ? 3 : 1));
+            VDB_CHECK(os.next_calls == (block ? 3 : 1)); // No capacity-boundary fetch.
             VDB_CHECK(is.delivered == (block ? 1 : i + 1));
             if (block) {
                 const auto& b = dynamic_cast<BlockNestedLoopJoin&>(*join);
-                VDB_CHECK(b.Metrics().pending_boundary_tuples == 1 && b.Metrics().outer_blocks == 1);
+                VDB_CHECK(b.Metrics().inner_scans == 1);
                 VDB_CHECK(b.Metrics().candidate_comparisons == i + 1);
             }
         }
@@ -345,7 +343,7 @@ void Lifecycle() {
         const auto saved = EncodeTuple(join->OutputSchema(), owned);
         Throws([&] { q.FinishQuery(*join); }, "requires root EOF");
         VDB_CHECK(ls.open && rs.open);
-        join->Close(); join->Close(); // Middle of current inner and block; pending is live for BNLJ.
+        join->Close(); join->Close(); // Middle of current inner and block.
         VDB_CHECK(!ls.open && !rs.open);
         Pins(db);
         Throws([&] { join->Next(row); }, "requires Init");
@@ -692,7 +690,7 @@ int main(int argc, char** argv) {
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
         {"empty_disjoint", EmptyAndDisjoint}, {"unequal_extreme", UnequalSchemasAndExtremeKeys},
         {"duplicate_multiplicity", DuplicateMultiplicity}, {"block_boundaries", BlockBoundaries},
-        {"resume_pending", ResumeAndPending}, {"lifecycle", Lifecycle},
+        {"resume_without_lookahead", ResumeWithoutLookahead}, {"lifecycle", Lifecycle},
         {"invalid_configuration", InvalidConfiguration}, {"memory_validation", MemoryValidation},
         {"wide_outer_payloads", WideOuterAndPayloads}, {"randomized_oracle", RandomizedOracle},
         {"maximum_output_schema", MaximumOutputSchema},

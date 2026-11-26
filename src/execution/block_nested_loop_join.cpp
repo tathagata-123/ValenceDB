@@ -23,38 +23,19 @@ BlockNestedLoopJoin::BlockNestedLoopJoin(QueryContext& context, JoinPlan plan,
 void BlockNestedLoopJoin::DoInit() {
     metrics_ = {};
     block_.reserve(memory_.block_capacity);
-    metrics_.modeled_peak_bytes = CheckedAdd(memory_.scratch_bytes,
-        CheckedMultiply(memory_.block_capacity, memory_.outer_row_bytes));
     outer_->Init();
 }
 
 bool BlockNestedLoopJoin::FillBlock() {
     assert(block_.empty() && !have_inner_);
-    if (have_pending_) {
-        block_.push_back(std::move(pending_));
-        pending_ = Tuple({});
-        have_pending_ = false;
-    }
-    while (!outer_exhausted_) {
-        if (!outer_->Next(pending_)) {
-            outer_exhausted_ = true;
-            pending_ = Tuple({});
-            break;
-        }
-        ++metrics_.outer_rows;
-        if (block_.size() == memory_.block_capacity) {
-            have_pending_ = true; // One fetched boundary row, charged to S, for the next block.
-            ++metrics_.pending_boundary_tuples;
-            break;
-        }
-        block_.push_back(std::move(pending_));
-        pending_ = Tuple({});
+    Tuple row({});
+    while (block_.size() < memory_.block_capacity && outer_->Next(row)) {
+        block_.push_back(std::move(row));
     }
     assert(block_.size() <= memory_.block_capacity);
     if (block_.empty()) return false;
     metrics_.peak_block_rows = std::max(metrics_.peak_block_rows, block_.size());
     inner_->Init();
-    ++metrics_.outer_blocks;
     ++metrics_.inner_scans;
     return true;
 }
@@ -90,10 +71,9 @@ void BlockNestedLoopJoin::DoClose() noexcept {
     inner_->Close();
     outer_->Close();
     std::vector<Tuple>().swap(block_);
-    pending_ = Tuple({});
     inner_row_ = Tuple({});
     position_ = 0;
-    have_pending_ = outer_exhausted_ = have_inner_ = false;
+    have_inner_ = false;
 }
 
 }  // namespace valencedb

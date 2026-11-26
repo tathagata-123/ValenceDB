@@ -766,7 +766,9 @@ void PlanStructure() {
         Near(p.plan.local_cost.pages, (2 * levels + 2) * std::ceil(1000.0L / 254));
         Near(p.plan.subtree_cost.pages, db.Table("t").heap_pages + p.plan.local_cost.pages);
         // Construction and explanation must not initialize any candidate, read pages, or allocate runs.
-        VDB_CHECK(aggregate->Metrics().input_rows == 0 && aggregate->Metrics().sort.initial_runs == 0);
+        Tuple unopened({});
+        Throws([&] { aggregate->Next(unopened); }, "Init");
+        VDB_CHECK(aggregate->Metrics().sort.initial_runs == 0);
         VDB_CHECK(db.Metrics().buffer_fetches == fetches);
         VDB_CHECK(db.Disk().counters().database_reads == io.database_reads);
         VDB_CHECK(db.Disk().counters().temporary_reads == io.temporary_reads);
@@ -787,7 +789,7 @@ void PlanStructure() {
             VDB_CHECK(metrics.used_internal_sort && !metrics.input_order_reused);
             VDB_CHECK(metrics.sort.initial_runs == size_t(std::ceil(1000.0L / memory.run_capacity)));
             VDB_CHECK(metrics.sort.intermediate_merge_passes == levels);
-            VDB_CHECK(metrics.sort.modeled_peak_bytes <= sort_bytes);
+            VDB_CHECK(memory.scratch_bytes + memory.descriptor_bytes + memory.run_capacity * memory.row_bytes <= sort_bytes);
             // Each materialized run has one writer. A second sorter would add relations here.
             VDB_CHECK(q.Temps().Metrics().temp_relations_created == replay * metrics.sort.materialized_runs);
             VDB_CHECK(db.Metrics().active_pins == 0);

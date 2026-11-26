@@ -59,24 +59,29 @@ M = local override, or QueryResources.work_memory_bytes (default 1,048,576)
 C_block = floor((M - S) / Touter)
 ```
 
-Require **M > S before subtracting**, then require C_block >= 1 and a representable vector size. Invalid configuration fails before child Init/Next. BNLJ never silently falls back to NLJ. S includes two page allowances plus current/pending/output tuple scratch and fixed control state; using the joined output charge matters when it is much wider than either input. Shared helpers reject addition, multiplication, rounding, and subtraction overflow.
+Require **M > S before subtracting**, then require C_block >= 1 and a representable vector size. Invalid configuration fails before child Init/Next. BNLJ never silently falls back to NLJ. S includes two page allowances plus input/current-inner/output tuple scratch and fixed control state; using the joined output charge matters when it is much wider than either input. Shared helpers reject addition, multiplication, rounding, and subtraction overflow.
 
 Init deliberately reserves C_block vector slots once; pushes never exceed that logical capacity. Capacity derives from the formula, not `vector.capacity()` or allocator inspection. Worst-case schema width governs even for empty/short actual VARCHAR values. Modeled peak is **S + C_block*Touter**, including reserved slots even for a short relation. This is an educational ownership model, not exact RSS, malloc accounting, or a global admission limit.
 
 **F = shared BufferPool frames** and **M = private operator memory** are separate. Full queries require F >= 8, but C_block is independent of F. Each simultaneously live heavyweight operator receives its own numeric allowance. Nested-loop join does not reserve memory across a query tree.
 
-## Blocks, pending rows, and continuation
+## Blocks and continuation
 
-BNLJ state consists of one bounded `vector<Tuple>`, at most one pending outer Tuple, at most one current inner Tuple, the next outer-block position, and small presence/EOF flags.
+BNLJ retains one bounded `vector<Tuple>`, one current inner tuple, the next
+block position, and an inner-row presence flag.
 
-1. Start an empty block with pending, if present, moving it exactly once.
-2. Fetch outer rows and append while the block has room. Once full, fetch one boundary row: keep it pending, outside the vector and charged to S. If that fetch instead sees EOF, mark outer exhausted. Never replay outer or discard the boundary row.
-3. For a nonempty block, initialize inner **once**. An empty block at exhausted outer means join EOF without an inner Init.
-4. Retain one inner tuple and compare it with each block row. Advance the block position before returning each match; the next Next resumes there with the same inner tuple.
-5. After all positions are checked, discard the current inner tuple and fetch the next, resetting position to zero.
-6. At inner EOF, close inner, clear/reuse the vector, and fill the next block. A final partial block gets one full inner scan.
+1. Fill an empty block while its size is below capacity and outer.Next succeeds.
+   Never fetch a row just to discover that the block is already full.
+2. If the block is empty, return EOF. Otherwise initialize inner once.
+3. For each inner tuple, compare every block row. Advance the block position
+   before returning a match; the next Next resumes with the same inner tuple.
+4. At inner EOF, close inner, clear the block and repeat. A partial final block
+   receives the same complete inner scan as a full block.
 
-The block never exceeds C_block and pending never exceeds one tuple. No inner/output collection exists. At C_block=1, the same state machine remains correct. A full block followed by EOF creates no extra empty block. All-equal A-by-B inputs emit exactly A*B outputs across any number of blocks.
+The child's Executor caches EOF, so no separate outer EOF flag is needed.
+Exact-capacity inputs make one later fill attempt that returns an empty block;
+this does not initialize inner. Capacity one and empty inputs use the same loop.
+All-equal A-by-B inputs emit exactly A*B rows without retaining the result.
 
 Worked example with left physical outer, C_block=3:
 
@@ -91,7 +96,7 @@ Next #4 -> B,Y  (same inner Y)
 Next #5 -> EOF  (C,Y and all three pairs with Z fail)
 ```
 
-This makes nine comparisons, four outputs, one block, and one inner scan. Another outer tuple already fetched after C would be pending and would start the next block; it is neither emitted twice nor lost. Right-as-outer uses the same traversal but assembles logical Left+Right output. Emission order is not a metadata promise.
+This makes nine comparisons, four outputs, one block, and one inner scan. The next outer tuple is fetched only after this block finishes. Right-as-outer uses the same traversal but assembles logical Left+Right output. Emission order is not a metadata promise.
 
 ## Metrics and representative evidence
 
@@ -99,18 +104,14 @@ Counters reset at Init and survive Close. They count operations to date on parti
 
 | Counter | Meaning |
 |---|---|
-| outer_rows | Rows fetched from physical outer, including pending when present |
 | inner_scans | Successful inner Init calls, including the first |
-| candidate_comparisons | Key pairs compared; full consumption equals outer_rows * inner_rows |
+| candidate_comparisons | Key pairs compared; full consumption equals outer cardinality * inner cardinality |
 | output_rows | Matching pairs returned to caller |
-| outer_blocks (BNLJ) | Nonempty blocks whose inner Init succeeded; equals inner_scans |
-| peak_block_rows (BNLJ) | Maximum populated vector size, excluding pending |
-| pending_boundary_tuples (BNLJ) | Total boundary handoffs, retained one at a time |
-| modeled_peak_bytes (BNLJ) | S + C_block*Touter after reserve; not RSS |
+| peak_block_rows (BNLJ) | Maximum populated vector size |
 
 `NestedLoopJoin::Metrics()` returns `const NestedLoopJoinMetrics&`. BNLJ's accessor returns `const BlockNestedLoopJoinMetrics&`; `Memory()` returns `const BlockNestedLoopJoinMemory&` with `max_bytes`, `outer_row_bytes`, `scratch_bytes`, and `block_capacity`.
 
-For fixed capacity, outer_blocks = ceil(outer_rows/C_block). An 11-row left and 8-row right, all keys equal, produce **88 rows** in both orientations: NLJ scans inner 11/8 times; BNLJ at capacity 3 scans it **4/3 times**, with pending counts 3/2 and comparisons 88 either way. Both match the independent encoded reference multiset. The join tests validate duplicate multiplicity, orientation, replay, bounded-memory state, fallback, failure handling, and pin cleanup.
+For fixed capacity, BNLJ inner_scans = ceil(outer cardinality/C_block). An 11-row left and 8-row right, all keys equal, produce **88 rows** in both orientations: NLJ scans inner 11/8 times; BNLJ at capacity 3 scans it **4/3 times**, with 88 comparisons either way. Both match the independent encoded reference multiset. The join tests validate duplicate multiplicity, orientation, replay, bounded-memory state, fallback, failure handling, and pin cleanup.
 
 ## Logical scan cost versus measured I/O
 
@@ -157,9 +158,9 @@ The public header is `execution/grace_hash_join.hpp`. `GraceHashJoinPlan` contai
 
 ### Partitioning and phase ownership
 
-The retained phases are Closed, SelectPair, Probe, Fallback, and Done. Partition and Build are synchronous functions, not persistent states. Init creates p left writers, consumes left once to EOF, closes that child, and finishes every writer into a value descriptor. The local writer vector **and every writer object/private page are destroyed on return from Partition**, before the right-side call allocates its writers. It repeats exactly once for right using the same p. Both original children are closed before Init returns; Next never reopens them.
+The retained phases are SelectPair, Probe and Fallback; Executor owns closed/EOF state. Partition and Build are synchronous functions, not persistent states. Init creates p left writers, consumes left once to EOF, closes that child, and finishes every writer into a value descriptor. The local writer vector **and every writer object/private page are destroyed on return from Partition**, before the right-side call allocates its writers. It repeats exactly once for right using the same p. Both original children are closed before Init returns; Next never reopens them.
 
-Each owned input tuple is appended once to `PartitionHash(key) % p`. PartitionHash converts signed INT64 to uint64_t before addition/mixing, so negative keys and both extremes have defined behavior. Its explicit integer mixer uses a fixed partition seed. The in-memory BuildHash uses the same mixer with a different fixed seed; no default implementation-dependent integer hash governs partition routing. Equal keys always route together. Neither hash is cryptographic.
+Each owned input tuple is appended once to `PartitionHash(key) % p`. PartitionHash converts signed INT64 to uint64_t before addition/mixing, so negative keys and both extremes have defined behavior. Its explicit integer mixer uses a fixed partition seed. The in-memory BuildHash uses the same mixer with a different fixed seed; no default implementation-dependent integer hash governs partition routing. Equal keys always route together. Both hash implementations are private; separate seeds avoid correlated bucket selection inside a partition. Neither hash is cryptographic.
 
 The two vector<TempRun> arrays contain at most p sealed values each and remain bounded until Close. Descriptors borrow the operator’s immutable left/right schemas. Empty writers finish with zero pages. Each writer owns a private 4096-byte image; brief BufferPool guards copy/allocate pages. Writers are retained through unique_ptr for straightforward simultaneous partition construction. The complete writer vector dies before the opposite side or hash build begins; no reader/writer retains a guard across calls.
 
@@ -198,11 +199,15 @@ Representative two-INT64 schemas on both sides give Tleft=Tright=168, Toutput=26
 
 ### Bounded build and resumable probe
 
-Each build constructs one `std::unordered_multimap<int64_t, Tuple, BuildHash>`. It sets max_load_factor(1.0f), deliberately reserves `min(partition_rows, build_capacity)`, and checks `table.size() < build_capacity` before **every new row insertion**. The smaller reserve is bounded by the published capacity; no allocator/bucket-size introspection determines admission. Every duplicate build tuple gets its own entry.
+Each build constructs one `std::unordered_multimap<int64_t, Tuple, BuildHash>`. It uses the standard default load factor of one and reserves the exact partition row count, which SelectPair has already checked against capacity. Before inserting, it rejects a row beyond that exact count. At build EOF it checks that the table size equals the count. No allocator/bucket-size introspection determines admission. Every duplicate build tuple gets its own entry.
 
 The entire build completes before any pair output. Then its reader and private staging page are destroyed and the opposite partition's probe reader opens. The table stays immutable throughout probe. State retains one owned probe Tuple and an equal_range iterator pair. Each Next copies logical Left+Right from one matching build entry and the probe tuple, advances the iterator, and returns. After the range ends, it replaces the probe tuple. Left build maps `(build,probe)` to `(Left,Right)`; Right build maps `(probe,build)` to `(Left,Right)`. A 2-by-3 duplicate key yields all six pairs, including identical payloads.
 
-The runtime insertion check remains defensive even though sealed TempReader metadata normally makes it exact. If another build row would exceed capacity, close the build reader, destroy the entire hash object including buckets, destroy the local build tuple/page on return, and begin fallback before emitting. A small test friend directly calls Build with a reduced capacity to bypass the descriptor precheck: three rows retained, a fourth read triggers abandonment, zero hash outputs, and fallback emits the full 8-by-9=72 result. No fault scheduler or production corruption API was added. Detected temporary-page corruption still raises DbError under the executor layer; this fallback does not repair corrupt storage.
+Unexpected build/count disagreement fails the query, before any pair output.
+There is no secondary build-abandonment/retry path. Tests add or remove a row
+through the ordinary scratch page format and verify failure, no BNLJ retry,
+no successful EOF, and checked resource cleanup. Successful writer counts are
+exact; general scratch-corruption recovery remains outside V1.
 
 Probe EOF destroys the reader, table nodes/buckets, current tuple, and both pair handles. There is only one active hash table, never a table collection or output queue. Close likewise destroys all active state and both partition vector capacities, closes children, and preserves metric snapshots. The summary counters retain no partition records, relations, or tuples.
 
@@ -228,9 +233,9 @@ Total: one hash pair, one fallback pair, one empty pair; 8556 rows
 
 ### Metrics, scratch, and logical transfers
 
-`Memory()` returns GraceHashJoinMemory with the values in the formulas. `Metrics()` resets at Init and survives Close. Summary counters record hash/fallback/empty pairs, left/right successful builds and fallback outers, peak build rows, modeled peak build bytes (S+Dghj+reserved_rows*Hside), output rows, peak partition writers. `completed_fallback_inner_scans` sums actual BNLJ inner scans only when each fallback reaches EOF; cancelled or failed partial pairs do not contribute.
+`Memory()` returns GraceHashJoinMemory with the values in the formulas. `Metrics()` resets at Init and survives Close. Summary counters record hash/fallback/empty pairs, left/right successful builds and fallback outers, peak build rows, output rows, peak partition writers. `completed_fallback_inner_scans` sums actual BNLJ inner scans only when each fallback reaches EOF; cancelled or failed partial pairs do not contribute.
 
-Row/page counts remain solely in the sealed TempRuns. There is no per-partition metric vector or synthetic completed-read accounting. Tests decode partitions, check routing and tuple multisets, derive expected strategies and page scans from the descriptors, and compare expected transfers against BufferPool fetch deltas. Live hash-table and fallback block inspection verifies admission and reduced memory bounds. DiskManager temporary reads, writes, and allocations remain the source of completed physical file-I/O evidence, including work completed before a failure. Failed transfers propagate errors rather than incrementing these counters.
+Row/page counts remain solely in the sealed TempRuns. There is no per-partition metric vector or synthetic completed-read accounting. Tests decode partitions, check routing and tuple multisets, independently pack the original input to predict strategies and page scans, and compare expected transfers against BufferPool fetch deltas. Peak occupancies, capacity formulas and boundary fixtures verify admission and reduced memory bounds without private executor inspection. DiskManager temporary reads, writes, and allocations remain the source of completed physical file-I/O evidence, including work completed before a failure. Failed transfers propagate errors rather than incrementing these counters.
 
 TempStore's `allocated_temp_pages` counts successful allocations across the **query**, including other operators. Physical DiskManager extent enforces the cap even if a NewPage installation fails. No subtraction on pair release occurs. Close and dropping descriptors perform **zero page-reclamation I/O**: no chain walk, reuse, or shrink. All pages, including released pairs, failed tails, and previous replay executions, count until checked FinishQuery or query cancellation resets scratch. TempScan/BNLJ fallback allocates no new temp pages. A downstream ExternalSort or a replay can exhaust the cap after old pair handles have been closed; tests cover both and propagate DbError, never truncated success.
 
@@ -240,9 +245,9 @@ With ideal equal packing, original input page counts N_R/N_S, and every pair fit
 N_R + N_S + 2*(partition_pages_R + partition_pages_S)
 ```
 
-This assumes the child scans cost those page reads and all partition pages participate. Empty-sided skipped pairs save their second-phase reads; per-partition tail waste changes packing. Logical temporary traffic is partition writes plus build/probe page scans or fallback rescans, including any abandoned build prefix. Physical file traffic must be measured separately because cached transfers need no file I/O.
+This assumes the child scans cost those page reads and all partition pages participate. Empty-sided skipped pairs save their second-phase reads; per-partition tail waste changes packing. Logical temporary traffic is partition writes plus build/probe page scans or fallback rescans. Physical file traffic must be measured separately because cached transfers need no file I/O.
 
-For a fallback pair, **replace** the usual single read of both partitions with `pages(outer) + ceil(rows(outer)/C_block)*pages(inner)`. Do not also charge a nonexistent full hash scan. A defensive failed build adds its actually read prefix before the fallback; physical I/O counters include completed transfers; no separate failure-prefix metric is retained.
+For a fallback pair, **replace** the usual single read of both partitions with `pages(outer) + ceil(rows(outer)/C_block)*pages(inner)`. Do not also charge a nonexistent full hash scan. Metadata disagreement fails the query; it contributes no fallback work.
 
 Algorithmic page-data passes differ from BufferPool fetches/hits/misses and DiskManager reads/writes. Physical allocation initializes pages and has separate counters. Cache hits can eliminate file reads, and file reads can hit the OS cache; neither ideal formulas nor BufferPool misses are physical device-I/O measurements.
 
@@ -256,8 +261,8 @@ Limitations: inner join only; one NONNULL INT64 equality key; unordered output; 
 
 ## Source and self-check
 
-Read [NestedLoopJoin::Next](../src/execution/nested_loop_join.cpp), [BlockNestedLoopJoin::FillBlock/Next](../src/execution/block_nested_loop_join.cpp), and [GraceHashJoin::Partition/SelectPair/Build/BeginFallback/Next](../src/execution/grace_hash_join.cpp). [join_helpers.hpp](../src/execution/join_helpers.hpp) preserves logical Left+Right through physical swaps; [TempScan](../src/execution/temp_scan.cpp) gives fallback its rewindable inner.
+Read [NestedLoopJoin::DoNext](../src/execution/nested_loop_join.cpp), [BlockNestedLoopJoin::FillBlock/DoNext](../src/execution/block_nested_loop_join.cpp), and [GraceHashJoin::Partition/SelectPair/Build/Probe/BeginFallback/DoNext](../src/execution/grace_hash_join.cpp). [join_helpers.hpp](../src/execution/join_helpers.hpp) preserves logical Left+Right through physical swaps; [TempScan](../src/execution/temp_scan.cpp) gives fallback its rewindable inner.
 
 NLJ and BNLJ both perform O(n_left*n_right) candidate comparisons, plus output construction; BNLJ changes scan multiplicity, not comparisons. Fitting GHJ has expected linear partition/build/probe work plus output under ordinary hash assumptions; skew fallback can restore quadratic comparisons/output. Memory remains bounded by each operator's model in all cases. No inner-match collection or complete-result vector is retained.
 
-The tests exercise continuation state around emitted rows, pending-row ownership, partition-pair fallback, duplicate multiplicity, modeled side selection, and BNLJ fallback orientation.
+The tests exercise continuation state around emitted rows, absence of block boundary over-read, partition-pair fallback, duplicate multiplicity, modeled side selection, and BNLJ fallback orientation.

@@ -10,9 +10,8 @@ struct BlockNestedLoopJoinMemory {
 BlockNestedLoopJoinMemory ComputeBlockJoinMemory(const QueryResources&, const Schema& outer,
     const Schema& inner, const Schema& output, std::optional<size_t> memory_bytes = std::nullopt);
 struct BlockNestedLoopJoinMetrics {
-    size_t outer_rows = 0, outer_blocks = 0, inner_scans = 0;
+    size_t inner_scans = 0;
     size_t candidate_comparisons = 0, output_rows = 0, peak_block_rows = 0;
-    size_t pending_boundary_tuples = 0, modeled_peak_bytes = 0;
 };
 
 class BlockNestedLoopJoin final : public Executor {
@@ -36,9 +35,9 @@ private:
     BlockNestedLoopJoinMemory memory_{};
     BlockNestedLoopJoinMetrics metrics_;
     std::vector<Tuple> block_;
-    Tuple pending_{{}}, inner_row_{{}};
+    Tuple inner_row_{{}};
     size_t position_ = 0;
-    bool have_pending_ = false, outer_exhausted_ = false, have_inner_ = false;
+    bool have_inner_ = false;
     bool FillBlock();
 };
 

@@ -56,9 +56,9 @@ Both APIs use one state and consume their raw child once. They allocate no hash 
 
 ## Bounded HashAggregate
 
-Grouped Init calls BuildGroups with a local map and optional writer. Persistent phases describe only output: EmitHash, CombinePartials, EmitGlobal, Done, and Closed. No setup phase needs to survive a call.
+Grouped Init calls BuildGroups with the owned table and a local optional writer. Persistent phases describe only output: EmitHash, CombinePartials, EmitGlobal and Done. No setup phase needs to survive a call.
 
-The group table is an ordinary `unordered_map<int64_t, AggregateState>`. One bounded reserve sets max_load_factor(1.0f) and reserves the derived capacity. Admission checks the logical number of groups, without querying buckets or allocator internals.
+The group table is an ordinary `unordered_map<int64_t, AggregateState>`. One bounded reserve uses the default load factor of one and the derived capacity. Admission checks the logical number of groups, without querying buckets or allocator internals.
 
 For every owned input row, first look up its key. Existing groups update in place, including when the map is full. A new group inserts if there is a slot. A new key at capacity triggers a flush:
 
@@ -69,7 +69,7 @@ For every owned input row, first look up its key. Existing groups update in plac
 
 The loop's owned Tuple remains alive throughout the flush, so no replay, duplicate fetch, or lost trigger is necessary. There is only one writer accumulating the partial page chain across all batches. Repeated keys reduce table pressure; row count alone never causes a spill. Tests fill the table exactly and continue updating existing keys, and also perform 20,000 updates across two keys without spilling.
 
-After the final partial batch, BuildGroups returns optional<TempRun> from Finish. Its local map (including buckets), writer staging page, and input tuple are destroyed on return. Init constructs the sorter afterward; TempScan copies the returned descriptor. No partial descriptor or writer remains in HashAggregate. The existing combine scratch allowance covers these small value copies and reader metadata; the separate page allowance covers TempScan staging.
+After the final partial batch, BuildGroups returns optional<TempRun> from Finish. It explicitly destroys the table including buckets before returning; the local writer staging page and input tuple also die on return. Init constructs the sorter afterward; TempScan copies the returned descriptor. No partial descriptor or writer remains in HashAggregate. The existing combine scratch allowance covers these small value copies and reader metadata; the separate page allowance covers TempScan staging.
 
 If no overflow occurred, close the child and stream finalized rows directly from the stable bounded map. There is no separate collection of output rows and no temporary allocation.
 
@@ -86,7 +86,7 @@ EOF:        final flush partial(3), partial(1); finish
 release:    writer and complete map destroyed
 sort:       partial keys 1,1,2,3
 combine:    one result for 1, one for 2, one for 3
-metrics:    overflow_flushes=1, spill_batches=2, spill_records=4
+metrics:    spill_batches=2, spill_records=4
 ```
 
 The partial schema is fixed, nonnullable, and all INT64:
@@ -155,7 +155,7 @@ Representative measured configuration for two INT64 input columns and all output
 
 The final merge streams. With M=65536, the scale fixture has capacity=287 and writes 21 batches/5741 partials. Maximum-width input tests exercise Tinput=4672 dominating Tpartial=360: S=23232 and Ccombine=15040. Narrow encoded partial states still determine ExternalSort's own row charge.
 
-SortAggregate owns one `unique_ptr<Executor> input_`. Construction wraps unordered grouped input in one ExternalSort using the reduced allowance; ordered input is used directly. Init, Next, and Close all use input_. Close preserves that tree for replay. The nonzero sort allowance identifies the wrapper for metric snapshots without a second pointer or dynamic cast. The optimizer still unwraps its displayed internal-sort plan node before constructing SortAggregate, so there is exactly one physical sorter.
+SortAggregate owns one `unique_ptr<Executor> input_`. Construction wraps unordered grouped input in one ExternalSort using the reduced allowance; ordered input is used directly. Init, Next, and Close all use input_. Close preserves that tree for replay. The nonzero sort allowance identifies the wrapper for metric snapshots without a second pointer or dynamic cast. The optimizer supplies the raw child to SortAggregate; the constructor creates exactly one physical sorter when needed.
 
 ## Lifetime, resources, and measurements
 
@@ -169,16 +169,14 @@ DbError propagates for overflow, resource exhaustion, and child/I/O errors; thes
 
 Memory() exposes AggregateMemory's max_bytes, maximum_row_bytes, scratch_bytes, combine_bytes, hash_group_capacity, and sort_memory_bytes (zero when no internal sort allowance is needed). Metrics() exposes:
 
-- `input_rows`: raw rows processed by hash/global aggregation, or sorted/raw rows fetched into the SortAggregate group loop, including one fetched boundary row. An early-closed unordered SortAggregate can have consumed fewer rows into this loop than its sorter already consumed from the original child.
-- `peak_hash_groups`, `modeled_peak_hash_bytes`: bounded table occupancy and full reservation charge; zero outside grouped HashAggregate.
-- `overflow_flushes`: completed overflow-triggered batches only.
+- `peak_hash_groups`: bounded table occupancy; zero outside grouped HashAggregate.
 - `spill_batches`: completed nonempty partial batches, **including final flush**.
 - `spill_records`: successfully appended partial records, including a partial batch prefix if execution fails.
 - `output_groups`: finalized rows emitted; global aggregation emits one.
 - `used_internal_sort`, `input_order_reused`: actual physical path.
-- `sort`: an ExternalSortMetrics snapshot after Init and at Close, including initial/materialized runs and completed merge passes.
+- `sort`: an ExternalSortMetrics snapshot after successful sort Init (sort counters do not change during streamed output), including initial/materialized runs and completed merge passes.
 
-TempStore reports cumulative pages separately. ExternalSort run counts, BufferPool fetches/misses, and DiskManager file reads/writes describe different work; they are not interchangeable "disk I/O" counts and do not measure physical device traffic.
+The table reservation charge is derived from Memory(): `scratch_bytes + hash_group_capacity*kAggregateGroupCharge`. A successful spilling aggregate has at least two spill batches, including the final nonempty table. Failure-time metrics are partial diagnostics. TempStore reports cumulative pages separately. ExternalSort run counts, BufferPool fetches/misses, and DiskManager file reads/writes describe different work; they are not interchangeable "disk I/O" counts and do not measure physical device traffic.
 
 The tested ExternalSort(HashAggregate(GraceHashJoin(...))) uses GHJ M=65536, aggregate M=32768, final sort M=32768, and F=8. GHJ emits 600 rows, the aggregate spills three batches and returns 300 groups, and the final sort creates six runs. Original children execute once; all operators retain independent local allowances, with one cumulative temp cap. No sum-of-allowances query admission is imposed.
 

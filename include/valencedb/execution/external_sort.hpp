@@ -23,11 +23,7 @@ struct ExternalSortMetrics {
     size_t intermediate_merge_passes = 0; // Completed materialized levels only.
     size_t final_merge_fan_in = 0;
     bool final_merge_streamed = false;
-    size_t pending_boundary_tuples = 0;
     size_t peak_retained_rows = 0; // Normal run rows or merge heads; excludes fixed scratch.
-    size_t peak_run_descriptors = 0; // Maximum size of either descriptor vector.
-    size_t peak_merge_heads = 0;
-    size_t modeled_peak_bytes = 0; // Reserved phase capacity, not RSS.
 };
 
 class ExternalSort final : public Executor {
@@ -42,7 +38,6 @@ private:
     void DoInit() override;
     bool DoNext(Tuple& out) override;
     void DoClose() noexcept override;
-    enum class OutputMode { PrivateRun, Merge };
     using Runs = std::vector<TempRun>;
     struct MergeInput {
         std::unique_ptr<TempReader> reader;
@@ -59,7 +54,6 @@ private:
     const Schema schema_; // Outlives every run; never copied into descriptors.
     ExternalSortMemory memory_;
     ExternalSortMetrics metrics_;
-    OutputMode output_mode_ = OutputMode::PrivateRun;
     std::vector<Tuple> rows_;
     size_t position_ = 0;
     Runs current_runs_;

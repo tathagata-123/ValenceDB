@@ -149,9 +149,11 @@ void Bounds(const ExternalSort& sort) {
     const auto& m = sort.Memory();
     const auto& metrics = sort.Metrics();
     VDB_CHECK(metrics.peak_retained_rows <= std::max(m.run_capacity, m.merge_fan_in));
-    VDB_CHECK(metrics.peak_run_descriptors <= m.descriptor_capacity);
-    VDB_CHECK(metrics.peak_merge_heads <= m.merge_fan_in);
-    VDB_CHECK(metrics.modeled_peak_bytes <= m.max_bytes);
+    VDB_CHECK(metrics.initial_runs <= m.descriptor_capacity);
+    VDB_CHECK(metrics.final_merge_fan_in <= m.merge_fan_in);
+    const auto reserve = m.scratch_bytes + m.descriptor_bytes;
+    VDB_CHECK(reserve + m.run_capacity * m.row_bytes <= m.max_bytes);
+    VDB_CHECK(reserve + m.merge_fan_in * (kPageSize + kTempHandleOverhead + m.row_bytes) <= m.max_bytes);
 }
 void Report(const std::string& name, const ExternalSort& sort, QueryContext& q) {
     const auto& m = sort.Memory();
@@ -161,7 +163,7 @@ void Report(const std::string& name, const ExternalSort& sort, QueryContext& q) 
         << " D=" << m.descriptor_capacity << " R=" << m.descriptor_bytes << " C=" << m.run_capacity
         << " k=" << m.merge_fan_in << " initial=" << s.initial_runs << " materialized=" << s.materialized_runs
         << " passes=" << s.intermediate_merge_passes << " final=" << s.final_merge_fan_in
-        << " retained=" << s.peak_retained_rows << " modeled_peak=" << s.modeled_peak_bytes
+        << " retained=" << s.peak_retained_rows
         << " extent=" << q.Temps().Metrics().allocated_temp_pages
         << " physical_reads=" << io.temporary_reads << " writes=" << io.temporary_writes
         << " allocation_writes=" << io.temporary_allocations << '\n';
@@ -232,7 +234,6 @@ void PrivateAndBoundaries() {
         VDB_CHECK(state.inits == 1 && state.delivered == count && state.next_calls == count + 1);
         const size_t runs = (count + 13) / 14;
         VDB_CHECK(sort.Metrics().initial_runs == runs);
-        VDB_CHECK(sort.Metrics().pending_boundary_tuples == (runs == 0 ? 0 : runs - 1));
         if (count <= 14) {
             VDB_CHECK(!sort.Metrics().final_merge_streamed && sort.Metrics().materialized_runs == 0);
             VDB_CHECK(q.Temps().Metrics().temp_relations_created == 0);
@@ -276,7 +277,7 @@ void InspectRuns(Database& db, const ExternalSort& sort, const std::vector<Tuple
             const size_t first = run * sort.Memory().run_capacity;
             const size_t end = std::min(first + sort.Memory().run_capacity, source.size());
             const std::vector<Tuple> chunk(source.begin() + first, source.begin() + end);
-            Oracle(sort.OutputSchema(), 2, chunk, rows); // Includes every pending boundary row.
+            Oracle(sort.OutputSchema(), 2, chunk, rows); // Includes every run boundary row.
         }
         ++run;
     }
@@ -294,8 +295,7 @@ void MultiplePasses() {
     sort.Init(); Pins(db);
     VDB_CHECK(sort.Metrics().initial_runs == 23 && sort.Metrics().intermediate_merge_passes == 4);
     VDB_CHECK(sort.Metrics().final_merge_fan_in == 2 && sort.Metrics().materialized_runs == 44);
-    VDB_CHECK(sort.Metrics().pending_boundary_tuples == 22);
-    VDB_CHECK(sort.Metrics().peak_retained_rows == 14 && sort.Metrics().modeled_peak_bytes == 24528);
+    VDB_CHECK(sort.Metrics().peak_retained_rows == 14);
     const auto pages = q.Temps().Metrics().allocated_temp_pages;
     VDB_CHECK(pages == 107 && q.Temps().Metrics().allocated_temp_pages == pages);
     VDB_CHECK(q.Temps().Metrics().temp_relations_created == 44);
@@ -336,7 +336,7 @@ void FanInExceedsFrames() {
     sort.Init(); Pins(db);
     VDB_CHECK(sort.Memory().run_capacity == 143 && sort.Memory().merge_fan_in == 20);
     VDB_CHECK(sort.Metrics().initial_runs == 11 && sort.Metrics().intermediate_merge_passes == 0);
-    VDB_CHECK(sort.Metrics().final_merge_fan_in == 11 && sort.Metrics().peak_merge_heads == 11);
+    VDB_CHECK(sort.Metrics().final_merge_fan_in == 11);
     VDB_CHECK(sort.Metrics().final_merge_fan_in > db.Buffer().FrameCount());
     const auto pages = q.Temps().Metrics().allocated_temp_pages;
     const auto relations = q.Temps().Metrics().temp_relations_created;
@@ -356,20 +356,22 @@ void FanInExceedsFrames() {
 void FanInAndDescriptorErrors() {
     Files files;
     Database db(files.db, OpenMode::CreateNew, files.temp, 8);
-    {
-        QueryContext q(db, {16384, 16384});
+    for (size_t memory : {size_t{11000}, size_t{16384}}) {
+        QueryContext q(db, {memory, 16384});
         const Schema narrow(SchemaKind::Base, {{"key", TypeId::Int64}});
         std::vector<Tuple> rows;
-        for (int64_t i = 38; i >= 0; --i) rows.emplace_back(std::vector<Value>{Value(i)});
         SourceState state;
         ExternalSort one(q, {0}, std::make_unique<Source>(q, narrow, rows, state));
-        VDB_CHECK(one.Memory().run_capacity == 39 && one.Memory().merge_fan_in == 1);
+        VDB_CHECK(one.Memory().run_capacity == (memory == 11000 ? 1 : 39));
+        VDB_CHECK(one.Memory().merge_fan_in == (memory == 11000 ? 0 : 1));
+        for (size_t i = one.Memory().run_capacity; i > 0; --i)
+            rows.emplace_back(std::vector<Value>{Value(static_cast<int64_t>(i))});
         one.Init(); Oracle(narrow, 0, rows, Drain(db, one)); one.Close();
         rows.emplace_back(std::vector<Value>{Value(int64_t{-1})});
         SourceState fail;
         ExternalSort many(q, {0}, std::make_unique<Source>(q, narrow, rows, fail));
         Throws([&] { many.Init(); }, "fan-in");
-        VDB_CHECK(!many.Exhausted() && fail.inits == 1 && fail.delivered == 40);
+        VDB_CHECK(!many.Exhausted() && fail.inits == 1 && fail.delivered == rows.size());
         VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 0);
         many.Close(); q.Close(); Clean(db, files);
     }
@@ -380,7 +382,7 @@ void FanInAndDescriptorErrors() {
         ExternalSort sort(q, {2}, Child(q, rows, state));
         Throws([&] { sort.Init(); }, "descriptor cap");
         VDB_CHECK(sort.Memory().descriptor_capacity == 24);
-        VDB_CHECK(sort.Metrics().initial_runs == 24 && sort.Metrics().peak_run_descriptors == 24);
+        VDB_CHECK(sort.Metrics().initial_runs == 24);
         VDB_CHECK(q.Temps().Metrics().temp_relations_created == 24);
         VDB_CHECK(state.inits == 1 && state.delivered == rows.size());
         VDB_CHECK(!sort.Exhausted()); Bounds(sort); Pins(db);
@@ -583,7 +585,7 @@ void PipelineAndPayloads() {
 
 int main(int argc, char** argv) {
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
-        {"memory_validation", MemoryValidation}, {"private_boundaries_pending", PrivateAndBoundaries},
+        {"memory_validation", MemoryValidation}, {"private_boundaries", PrivateAndBoundaries},
         {"multiple_passes_runs", MultiplePasses}, {"multiway_unique", MultiwayAndUnique},
         {"fanin_exceeds_frames", FanInExceedsFrames}, {"fanin_descriptor_errors", FanInAndDescriptorErrors},
         {"replay_early_close", ReplayAndEarlyClose}, {"cumulative_temp_limit", CumulativeTempLimit},

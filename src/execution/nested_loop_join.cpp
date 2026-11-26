@@ -25,7 +25,6 @@ bool NestedLoopJoin::DoNext(Tuple& out) {
         if (!have_outer_) {
             if (!outer_->Next(outer_row_)) return false;
             have_outer_ = true;
-            ++metrics_.outer_rows;
             inner_->Init();
             ++metrics_.inner_scans;
         }
