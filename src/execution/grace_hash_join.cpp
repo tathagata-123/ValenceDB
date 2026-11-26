@@ -3,7 +3,6 @@
 #include "join_helpers.hpp"
 #include <algorithm>
 #include <cassert>
-#include <new>
 
 namespace valencedb {
 namespace {
@@ -24,41 +23,6 @@ size_t GraceHashJoin::BuildHash::operator()(int64_t key) const noexcept {
     return static_cast<size_t>(Mix(static_cast<uint64_t>(key) + UINT64_C(0xd1b54a32d192ed03)));
 }
 
-GraceHashJoinMemory ComputeGraceJoinMemory(const QueryResources& resources,
-    const Schema& left, const Schema& right, const Schema& output, std::optional<size_t> memory_bytes) {
-    GraceHashJoinMemory m{};
-    m.max_bytes = ResolveBudget(resources, memory_bytes).max_bytes;
-    m.left_row_bytes = RowMemoryCharge(left);
-    m.right_row_bytes = RowMemoryCharge(right);
-    m.scratch_bytes = FixedScratchCharge(std::max({m.left_row_bytes,
-        m.right_row_bytes, RowMemoryCharge(output)}));
-    if (m.max_bytes <= m.scratch_bytes)
-        throw DbError("Grace join memory cannot cover scratch");
-    const size_t available = RemainingMemory(m.max_bytes, m.scratch_bytes);
-    // Both run arrays coexist with one side's writers.
-    constexpr size_t pair_bytes = 2 * kTempRunCharge;
-    m.partition_count = std::min(size_t{64},
-        available / (kPageSize + kTempHandleOverhead + pair_bytes));
-    if (m.partition_count < 2) throw DbError("Grace join requires at least two partitions");
-    m.descriptor_bytes = CheckedMultiply(pair_bytes, m.partition_count);
-    const size_t reserve = CheckedAdd(m.scratch_bytes, m.descriptor_bytes);
-    if (m.max_bytes <= reserve) throw DbError("Grace join cannot cover descriptors");
-    const size_t build_bytes = RemainingMemory(m.max_bytes, reserve);
-    m.left_build_capacity = build_bytes / HashBuildRowCharge(left);
-    m.right_build_capacity = build_bytes / HashBuildRowCharge(right);
-    m.fallback_memory = RemainingMemory(m.max_bytes, m.descriptor_bytes);
-    m.left_block_capacity = build_bytes / m.left_row_bytes;
-    m.right_block_capacity = build_bytes / m.right_row_bytes;
-    const size_t block_max = std::vector<Tuple>().max_size();
-    if (m.left_block_capacity > block_max) m.left_block_capacity = 0;
-    if (m.right_block_capacity > block_max) m.right_block_capacity = 0;
-    if (!m.left_block_capacity && !m.right_block_capacity)
-        throw DbError("Grace join fallback cannot hold a legal outer block");
-    if (m.left_build_capacity > std::unordered_multimap<int64_t, Tuple>().max_size() ||
-        m.right_build_capacity > std::unordered_multimap<int64_t, Tuple>().max_size())
-        throw DbError("Grace join build capacity is unrepresentable");
-    return m;
-}
 
 GraceHashJoin::GraceHashJoin(QueryContext& context, GraceHashJoinPlan plan,
     std::unique_ptr<Executor> left, std::unique_ptr<Executor> right)
@@ -88,18 +52,11 @@ void GraceHashJoin::Partition(Executor& child, const Schema& schema, size_t key,
     for (auto& writer : writers) parts.push_back(writer->Finish());
 }
 
-void GraceHashJoin::Init() {
-    Start();
-    try {
-        metrics_ = {};
-        Partition(*left_, left_schema_, plan_.left_key, left_parts_);
-        Partition(*right_, right_schema_, plan_.right_key, right_parts_);
-        phase_ = Phase::SelectPair;
-    } catch (const std::bad_alloc&) {
-        Close(); throw DbError("Grace join memory allocation failed");
-    } catch (const std::length_error&) {
-        Close(); throw DbError("Grace join allocation size is unrepresentable");
-    } catch (...) { Close(); throw; }
+void GraceHashJoin::DoInit() {
+    metrics_ = {};
+    Partition(*left_, left_schema_, plan_.left_key, left_parts_);
+    Partition(*right_, right_schema_, plan_.right_key, right_parts_);
+    phase_ = Phase::SelectPair;
 }
 
 bool GraceHashJoin::Build(size_t capacity) {
@@ -118,8 +75,6 @@ bool GraceHashJoin::Build(size_t capacity) {
         Tuple row({});
         while (reader.Next(row)) {
             if (table_->size() >= capacity) {
-                metrics_.failed_build_rows = CheckedAdd(metrics_.failed_build_rows,
-                                                        CheckedAdd(table_->size(), 1));
                 reader.Close();
                 table_.reset(); // Nodes AND buckets die before fallback is constructed.
                 return false;
@@ -194,46 +149,39 @@ void GraceHashJoin::ReleasePair() noexcept {
     phase_ = Phase::SelectPair;
 }
 
-bool GraceHashJoin::Next(Tuple& out) {
-    if (!Ready()) return false;
-    try {
-        for (;;) {
-            if (phase_ == Phase::SelectPair && !SelectPair()) return End();
-            if (phase_ == Phase::Fallback) {
-                if (fallback_->Next(out)) {
-                    ++metrics_.output_rows;
-                    return true;
-                }
-                metrics_.completed_fallback_inner_scans = CheckedAdd(
-                    metrics_.completed_fallback_inner_scans, fallback_->Metrics().inner_scans);
-                ReleasePair();
-                continue;
-            }
-            assert(phase_ == Phase::Probe);
-            if (match_ != match_end_) {
-                out = detail::JoinedTuple(match_->second, probe_row_, build_side_);
-                ++match_;
+bool GraceHashJoin::DoNext(Tuple& out) {
+    for (;;) {
+        if (phase_ == Phase::SelectPair && !SelectPair()) return false;
+        if (phase_ == Phase::Fallback) {
+            if (fallback_->Next(out)) {
                 ++metrics_.output_rows;
                 return true;
             }
-            probe_row_ = Tuple({});
-            if (!probe_->Next(probe_row_)) {
-                ReleasePair();
-                continue;
-            }
-            const size_t key = build_side_ == PhysicalOuter::Left ? plan_.right_key : plan_.left_key;
-            const auto range = table_->equal_range(probe_row_.value(key).as_int64());
-            match_ = range.first;
-            match_end_ = range.second;
+            metrics_.completed_fallback_inner_scans = CheckedAdd(
+                metrics_.completed_fallback_inner_scans, fallback_->Metrics().inner_scans);
+            ReleasePair();
+            continue;
         }
-    } catch (const std::bad_alloc&) {
-        Close(); throw DbError("Grace join memory allocation failed");
-    } catch (const std::length_error&) {
-        Close(); throw DbError("Grace join allocation size is unrepresentable");
-    } catch (...) { Close(); throw; }
+        assert(phase_ == Phase::Probe);
+        if (match_ != match_end_) {
+            out = detail::JoinedTuple(match_->second, probe_row_, build_side_);
+            ++match_;
+            ++metrics_.output_rows;
+            return true;
+        }
+        probe_row_ = Tuple({});
+        if (!probe_->Next(probe_row_)) {
+            ReleasePair();
+            continue;
+        }
+        const size_t key = build_side_ == PhysicalOuter::Left ? plan_.right_key : plan_.left_key;
+        const auto range = table_->equal_range(probe_row_.value(key).as_int64());
+        match_ = range.first;
+        match_end_ = range.second;
+    }
 }
 
-void GraceHashJoin::Close() noexcept {
+void GraceHashJoin::DoClose() noexcept {
     fallback_.reset();
     probe_.reset();
     match_ = match_end_ = Table::const_iterator{};
@@ -245,7 +193,6 @@ void GraceHashJoin::Close() noexcept {
     right_->Close();
     pair_ = 0;
     phase_ = Phase::Closed;
-    CloseState();
 }
 
 }  // namespace valencedb

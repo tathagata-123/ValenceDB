@@ -86,7 +86,7 @@ Insertion is also separate from read-query timing. An empty heap and empty index
 
 ## Structured schema and metrics
 
-Schema version 4 uses nested JSON objects; 64-bit hash accumulators are hex strings to avoid downstream floating-point loss. All integers represent counts/bytes unless named otherwise. Every successful record has:
+Schema version 5 uses nested JSON objects; 64-bit hash accumulators are hex strings to avoid downstream floating-point loss. All integers represent counts/bytes unless named otherwise. Every successful record has:
 
 | Field | Contents |
 |---|---|
@@ -100,13 +100,13 @@ Schema version 4 uses nested JSON objects; 64-bit hash accumulators are hex stri
 | `reference_validation`, `order_verified`, `finish_query_succeeded` | Applicable validation/lifecycle evidence; page/insert experiments use the documented exceptions |
 | `buffer` | Fetches/hits/misses, evictions/dirty evictions, write causes, CLOCK visits/decrements, ring reuses/fallbacks, pins |
 | `file_io` | Database/temp successful page reads/writes/allocations, and writes+allocations including initialization |
-| `scratch` | Cumulative allocations, pre-reset extent sum, peak single-query extent, post-reset extent/pins/cache mappings |
+| `scratch` | Successful allocations, writer constructions, post-reset physical extent/pins/cache mappings |
 | `success`, `failure_stage`, `failure_reason` | Boolean outcome; failed prefixes are invalid, and missing timings/counters remain unmeasured |
 | Runner fields | Suite/case/equivalence-group identifiers, exact executable argument array, observed platform |
 
 `order_verified` is present on query records and means advertised ordering was checked, not that unordered operators promise order. Some family-specific keys are intentionally absent when inapplicable. Failures always retain schema/configuration/outcome/stage/reason; subprocess/parse errors are marked `runner_validation` and may lack executable metadata. The runner returns nonzero for any unexpected failure or suite-equivalence error and excludes failures from successful medians. It reparses every saved line, checks required fields/digest format/counters/cleanup, verifies family-specific boundary fixtures, compares equivalence groups, and checks ordered digests where order is fully defined. The selected case matrix determines family coverage and exact expected record count.
 
-BufferPool and DiskManager expose cumulative counters. The harness **copies** both immediately before measured work and subtracts cumulative counters afterward, excluding setup, reopen, cache preparation and prior runs. No peak is subtracted: `peak_pins` explicitly covers the reopened pool lifetime, including metadata preload, and `peak_pins_at_start` is supplied. There is no resettable interval pin-peak API. Algorithm metrics reset at Init and are read after FinishQuery/Close; aggregate Close captures final internal-sort counters. TempMetrics is copied **before** FinishQuery resets current extent. A successful query checks zero physical/current scratch extent, zero pins, and no Temporary cache mappings afterward.
+BufferPool and DiskManager expose cumulative counters. The harness **copies** both immediately before measured work and subtracts cumulative counters afterward, excluding setup, reopen, cache preparation and prior runs. No peak is subtracted: `peak_pins` explicitly covers the reopened pool lifetime, including metadata preload, and `peak_pins_at_start` is supplied. There is no resettable interval pin-peak API. Algorithm metrics reset at Init and are read after FinishQuery/Close; aggregate Close captures final internal-sort counters. TempMetrics is copied for the query totals. A successful query checks zero physical scratch extent, zero pins, and no Temporary cache mappings afterward.
 
 Keep these layers distinct:
 
@@ -115,7 +115,7 @@ Keep these layers distinct:
 3. **File operations:** successful 4096-byte Read/Write calls and separate allocations. Allocation writes a zero page and flushes, counted as an allocation **instead of** an ordinary write. Total initialized-page write operations are writes + allocations. These are not fsync or device counters.
 4. **Scratch extent:** append-only allocated pages, including released relations, until whole-query reset. Release drops handles, performs no reclamation writes and does not shrink extent.
 
-The sort/aggregate APIs do not expose an exact all-phase logical temp-page transfer counter. Their run/spill counters and actual file/buffer traffic are recorded without inventing a perfect split. GHJ does expose partition-write/completed-read logical page counters. Peak retained rows/groups and modeled bytes are reported where the existing operator supports them. Input generation retains input vectors outside timing; the benchmark process is not bounded by operator M. No RSS is measured; **M is neither RSS nor a whole-query memory limit**. Each heavyweight operator and internal sorter has its own actual local allowance; allowances are not summed into a query cap. See [io_cost_models.md](io_cost_models.md) for underlying definitions.
+The sort/aggregate APIs do not expose an exact all-phase logical temp-page transfer counter. Their run/spill counters and actual file/buffer traffic are recorded without inventing a perfect split. GHJ exposes partition strategies and completed fallback scans; tests derive logical transfers from sealed run descriptors. Peak retained rows/groups and modeled bytes are reported where the existing operator supports them. Input generation retains input vectors outside timing; the benchmark process is not bounded by operator M. No RSS is measured; **M is neither RSS nor a whole-query memory limit**. Each heavyweight operator and internal sorter has its own actual local allowance; allowances are not summed into a query cap. See [io_cost_models.md](io_cost_models.md) for underlying definitions.
 
 ## Result validation
 
@@ -199,7 +199,7 @@ interpret the removed display node as removal of the sorting work.
 
 ## V1 Phase 2 schema version 4
 
-New records use `schema_version=4`; the runner requires version 4. The only
+Phase 2 records used `schema_version=4`; that runner required version 4. The only
 record change from version 3 is removal of `file_io.failed_reads` and
 `file_io.failed_writes`. Errors still fail the operation and appear in
 `success`, `failure_stage`, and `failure_reason`; failed transfers are not
@@ -227,3 +227,13 @@ leaf capacity 254 and otherwise matches the supplied leaf capacity. The probe
 prints elapsed time, fetches, reads, writes, allocations, evictions, and peak pins.
 The query benchmark harness continues to exercise insertion, IndexScan point/range
 access, and cross-component output equivalence without deletion.
+
+## V1 Phase 3 schema version 5
+
+The runner now requires `schema_version=5`. Query scratch records remove redundant
+`extent_before_reset_sum` and `peak_extent_pages`. Retained `allocated_temp_pages`
+counts successful TempStore NewPage returns; successful-query comparison with
+DiskManager allocations remains valid. Failure paths no longer repair this count.
+Current physical extent, pins, and cache mappings are still checked after cleanup.
+GHJ drops `failed_build_rows`; build peaks, partition strategies, fallback counts,
+completed fallback scans, and outputs remain. Old records are historical evidence.

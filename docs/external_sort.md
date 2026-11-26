@@ -35,7 +35,7 @@ Construction owns a copy of the output Schema shared by reference with every run
 
 `Close()` is noexcept and idempotent. It closes the child, destroys heap/readers, releases row-vector capacity, drops descriptors and their capacities, and preserves the base EOF marker. It performs no per-page reclamation. Close then Init recomputes from the child in the same active query; old scratch pages remain charged. A second Init without Close is an error. Early cancellation uses sort.Close followed by query.Close. FinishQuery requires observed normal EOF and performs checked whole-query cleanup.
 
-Init and Next unwind sort-owned state on execution failure. Model exhaustion, descriptor overflow, insufficient required fan-in, cumulative scratch exhaustion, and temporary I/O failure throw DbError, never EOF or truncated success. Allocation failures during execution are also translated to DbError. Callers must discard all output from a failed execution.
+Init and Next unwind sort-owned state on execution failure. Model exhaustion, descriptor overflow, insufficient required fan-in, cumulative scratch exhaustion, and temporary I/O failure throw DbError, never EOF or truncated success. The common Executor boundary closes the tree and propagates native allocation/length exceptions unchanged. Callers must discard all output from a failed execution.
 
 ## Modeled private memory
 
@@ -127,7 +127,7 @@ The 309-row full-width fixture cumulatively allocates **107 pages**. A separate 
 | peak_merge_heads | Maximum heap heads, always <= k |
 | modeled_peak_bytes | Maximum S+R plus C_sort*Tinput or merge inputs*(P+Tinput+128) |
 
-The generation charge is `C_sort*Tinput`, even for a short chunk, because its vector capacity is reserved. The phases reuse M. No value claims actual RSS. TempStore's `allocated_temp_pages`, `peak_temp_extent_pages`, and `temp_relations_created` remain cumulative query metrics. Existing DiskManager counters expose physical file-page reads/writes and allocation initialization operations; BufferPool counters expose fetches/hits/misses/evictions/pins. There is no new generic metric framework or claim that these layers are interchangeable.
+The generation charge is `C_sort*Tinput`, even for a short chunk, because its vector capacity is reserved. The phases reuse M. No value claims actual RSS. TempStore's `allocated_temp_pages` and `temp_relations_created` remain cumulative query metrics. Existing DiskManager counters expose physical file-page reads/writes and allocation initialization operations; BufferPool counters expose fetches/hits/misses/evictions/pins. There is no new generic metric framework or claim that these layers are interchangeable.
 
 ## Idealized page-data-pass model
 

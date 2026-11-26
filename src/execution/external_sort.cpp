@@ -2,7 +2,6 @@
 #include "valencedb/common/error.hpp"
 #include <algorithm>
 #include <cassert>
-#include <new>
 
 namespace valencedb {
 namespace {
@@ -14,24 +13,6 @@ Schema SortSchema(QueryContext& context, const std::unique_ptr<Executor>& child,
     return schema;
 }
 }
-ExternalSortMemory ComputeSortMemory(const QueryResources& resources, const Schema& schema,
-                              std::optional<size_t> override_bytes) {
-    ExternalSortMemory m{};
-    m.max_bytes = ResolveBudget(resources, override_bytes).max_bytes;
-    m.row_bytes = RowMemoryCharge(schema);
-    m.scratch_bytes = FixedScratchCharge(m.row_bytes);
-    m.descriptor_capacity = std::min(size_t{4096}, m.max_bytes / (16 * kTempRunCharge));
-    if (m.descriptor_capacity == 0) throw DbError("sort memory cannot hold run descriptors");
-    m.descriptor_bytes = CheckedMultiply(CheckedMultiply(2, m.descriptor_capacity), kTempRunCharge);
-    const size_t reserve = CheckedAdd(m.scratch_bytes, m.descriptor_bytes);
-    if (m.max_bytes <= reserve) throw DbError("sort memory cannot cover scratch and descriptors");
-    const size_t available = RemainingMemory(m.max_bytes, reserve);
-    m.run_capacity = available / m.row_bytes;
-    if (m.run_capacity == 0 || m.run_capacity > std::vector<Tuple>().max_size())
-        throw DbError("sort run capacity is zero or unrepresentable");
-    m.merge_fan_in = std::min(size_t{64}, available / CheckedAdd(kPageSize + kTempHandleOverhead, m.row_bytes));
-    return m;
-}
 
 ExternalSort::ExternalSort(QueryContext& context, ExternalSortPlan plan,
                            std::unique_ptr<Executor> child)
@@ -41,37 +22,28 @@ ExternalSort::ExternalSort(QueryContext& context, ExternalSortPlan plan,
 
 int64_t ExternalSort::Key(const Tuple& row) const { return row.value(plan_.column).as_int64(); }
 
-void ExternalSort::Init() {
-    Start(); // Repeated Init must not close a still-live execution.
-    try {
-        metrics_ = {};
-        position_ = 0;
-        current_runs_.reserve(memory_.descriptor_capacity);
-        rows_.reserve(memory_.run_capacity);
-        metrics_.modeled_peak_bytes = CheckedAdd(
-            CheckedAdd(memory_.scratch_bytes, memory_.descriptor_bytes),
-            CheckedMultiply(memory_.run_capacity, memory_.row_bytes));
-        child_->Init();
-        GenerateRuns();
-        child_->Close();
-        if (current_runs_.empty()) {
-            output_mode_ = OutputMode::PrivateRun;
-            return;
-        }
-        // Run rows and their capacity must be gone before allocating reader staging pages.
-        std::vector<Tuple>().swap(rows_);
-        MergePasses();
-        OpenMerge(0, current_runs_.size());
-        metrics_.final_merge_fan_in = current_runs_.size();
-        metrics_.final_merge_streamed = true;
-        output_mode_ = OutputMode::Merge;
-    } catch (const std::bad_alloc&) {
-        Close();
-        throw DbError("sort memory allocation failed");
-    } catch (const std::length_error&) {
-        Close();
-        throw DbError("sort allocation size is unrepresentable");
-    } catch (...) { Close(); throw; }
+void ExternalSort::DoInit() {
+    metrics_ = {};
+    position_ = 0;
+    current_runs_.reserve(memory_.descriptor_capacity);
+    rows_.reserve(memory_.run_capacity);
+    metrics_.modeled_peak_bytes = CheckedAdd(
+        CheckedAdd(memory_.scratch_bytes, memory_.descriptor_bytes),
+        CheckedMultiply(memory_.run_capacity, memory_.row_bytes));
+    child_->Init();
+    GenerateRuns();
+    child_->Close();
+    if (current_runs_.empty()) {
+        output_mode_ = OutputMode::PrivateRun;
+        return;
+    }
+    // Run rows and their capacity must be gone before allocating reader staging pages.
+    std::vector<Tuple>().swap(rows_);
+    MergePasses();
+    OpenMerge(0, current_runs_.size());
+    metrics_.final_merge_fan_in = current_runs_.size();
+    metrics_.final_merge_streamed = true;
+    output_mode_ = OutputMode::Merge;
 }
 
 void ExternalSort::GenerateRuns() {
@@ -190,29 +162,22 @@ void ExternalSort::MergePasses() {
     }
 }
 
-bool ExternalSort::Next(Tuple& out) {
-    if (!Ready()) return false;
-    try {
-        if (output_mode_ == OutputMode::PrivateRun) {
-            if (position_ == rows_.size()) return End();
-            out = std::move(rows_[position_++]);
-            return true;
-        }
-        if (!PullMerge(out)) return End();
+bool ExternalSort::DoNext(Tuple& out) {
+    if (output_mode_ == OutputMode::PrivateRun) {
+        if (position_ == rows_.size()) return false;
+        out = std::move(rows_[position_++]);
         return true;
-    } catch (const std::bad_alloc&) {
-        Close();
-        throw DbError("sort memory allocation failed");
-    } catch (...) { Close(); throw; }
+    }
+    if (!PullMerge(out)) return false;
+    return true;
 }
 
-void ExternalSort::Close() noexcept {
+void ExternalSort::DoClose() noexcept {
     child_->Close();
     CloseMerge();
     std::vector<Tuple>().swap(rows_);
     Runs().swap(current_runs_);
     position_ = 0;
-    CloseState(); // Scratch pages remain allocated until checked whole-query cleanup.
 }
 
 }  // namespace valencedb

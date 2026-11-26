@@ -7,19 +7,13 @@ TempScan::TempScan(QueryContext& context, const TempRun& run)
     : Executor(context), run_(run) {
     if (run.store_ != &context.Temps()) throw DbError("temp scan requires this query's run");
 }
-void TempScan::Init() {
-    Start();
-    try { reader_ = std::make_unique<TempReader>(run_); }
-    catch (const std::bad_alloc&) {
-        Close();
-        throw DbError("temp scan memory allocation failed");
-    } catch (...) { Close(); throw; }
+void TempScan::DoInit() {
+    reader_ = std::make_unique<TempReader>(run_);
 }
-bool TempScan::Next(Tuple& out) {
-    if (!Ready()) return false;
-    if (!reader_->Next(out)) return End();
+bool TempScan::DoNext(Tuple& out) {
+    if (!reader_->Next(out)) return false;
     return true;
 }
-void TempScan::Close() noexcept { reader_.reset(); CloseState(); }
+void TempScan::DoClose() noexcept { reader_.reset(); }
 
 }  // namespace valencedb

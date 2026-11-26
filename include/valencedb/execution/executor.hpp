@@ -25,8 +25,7 @@ private:
     Database& db_;
     QueryResources resources_;
     TempStore temps_;
-    size_t open_executors_ = 0;
-    bool active_ = true, succeeded_ = false;
+    bool succeeded_ = false;
 };
 
 class Executor {
@@ -35,18 +34,18 @@ public:
     virtual ~Executor() noexcept = default;
     Executor(const Executor&) = delete;
     Executor& operator=(const Executor&) = delete;
-    virtual void Init() = 0;
-    virtual bool Next(Tuple& out) = 0;
-    virtual void Close() noexcept = 0;
+    // These entry points own lifecycle and exception cleanup for the entire tree.
+    void Init();
+    bool Next(Tuple& out);
+    void Close() noexcept;
     virtual const Schema& OutputSchema() const = 0;
     virtual Ordering OutputOrdering() const = 0;
     bool Exhausted() const noexcept { return eof_; }
     QueryContext& Context() const noexcept { return context_; }
 protected:
-    void Start();
-    bool Ready() const;
-    bool End() noexcept { eof_ = true; return false; }
-    void CloseState() noexcept;
+    virtual void DoInit() = 0;
+    virtual bool DoNext(Tuple& out) = 0;
+    virtual void DoClose() noexcept = 0;
     QueryContext& context_;
 private:
     bool initialized_ = false, eof_ = false;

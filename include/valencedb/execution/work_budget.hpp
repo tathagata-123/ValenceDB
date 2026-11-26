@@ -10,8 +10,7 @@ struct QueryResources {
     size_t max_temp_pages = 16384;
     void Validate() const;
 };
-struct OperatorMemoryBudget { size_t max_bytes; };
-OperatorMemoryBudget ResolveBudget(const QueryResources& resources,
+size_t ResolveBudget(const QueryResources& resources,
                                    std::optional<size_t> override_bytes = std::nullopt);
 size_t CheckedAdd(size_t a, size_t b);
 size_t CheckedMultiply(size_t a, size_t b);

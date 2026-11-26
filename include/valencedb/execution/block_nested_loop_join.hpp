@@ -21,14 +21,14 @@ public:
                         std::unique_ptr<Executor> left, std::unique_ptr<Executor> right,
                         std::optional<size_t> memory_bytes = std::nullopt);
     ~BlockNestedLoopJoin() noexcept override { Close(); }
-    void Init() override;
-    bool Next(Tuple& out) override;
-    void Close() noexcept override;
     const Schema& OutputSchema() const override { return schema_; }
     Ordering OutputOrdering() const override { return {}; }
     const BlockNestedLoopJoinMemory& Memory() const noexcept { return memory_; }
     const BlockNestedLoopJoinMetrics& Metrics() const noexcept { return metrics_; }
 private:
+    void DoInit() override;
+    bool DoNext(Tuple& out) override;
+    void DoClose() noexcept override;
     JoinPlan plan_;
     std::unique_ptr<Executor> outer_, inner_;
     Schema schema_;

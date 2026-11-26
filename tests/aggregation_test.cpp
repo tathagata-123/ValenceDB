@@ -112,26 +112,23 @@ public:
            Ordering order = {})
         : Executor(q), schema_(std::move(schema)), rows_(rows), state_(state), order_(order) {}
     ~Source() noexcept override { Close(); }
-    void Init() override {
-        Start();
+    void DoInit() override {
         state_.open = true;
         pos_ = 0;
         if (++state_.inits > state_.allowed || state_.fail_init) throw DbError("child replay or Init failure");
     }
-    bool Next(Tuple& out) override {
-        if (!Ready()) return false;
+    bool DoNext(Tuple& out) override {
         Pins(context_.Db());
         ++state_.calls;
         if (pos_ == state_.fail_at) throw DbError("child Next failure");
-        if (pos_ == rows_.size()) return End();
+        if (pos_ == rows_.size()) return false;
         out = rows_[pos_++];
         ++state_.delivered;
         return true;
     }
-    void Close() noexcept override {
+    void DoClose() noexcept override {
         if (state_.open) ++state_.closes;
         state_.open = false;
-        CloseState();
     }
     const Schema& OutputSchema() const override { return schema_; }
     Ordering OutputOrdering() const override { return order_; }
@@ -267,7 +264,7 @@ void Capacity() {
         SourceState state;
         HashAggregate a(q, All(), MakeSource(q, rows, state));
         const size_t cap = a.Memory().hash_group_capacity;
-        VDB_CHECK(cap == 117 && a.Memory().scratch_bytes == 10296 && a.Memory().sort_memory_bytes == 26568);
+        VDB_CHECK(cap == 117 && a.Memory().scratch_bytes == 10296 && a.Memory().sort_memory_bytes == 26440);
         const size_t groups = static_cast<size_t>(static_cast<int>(cap) + offset);
         for (size_t i = 0; i < groups; ++i) rows.push_back(Row(static_cast<int64_t>(i), 2));
         if (offset == 0) for (size_t i = 0; i < 2000; ++i) rows.push_back(Row(static_cast<int64_t>(i % cap), -1));

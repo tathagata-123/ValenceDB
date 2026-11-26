@@ -10,6 +10,8 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <new>
+#include <stdexcept>
 #include <type_traits>
 
 using namespace valencedb;
@@ -454,6 +456,67 @@ void ExecutionFailures() {
     CleanScratch(db, files); db.Close();
 }
 
+// Exercise common exception cleanup with live scratch, through a parent operator.
+class FailingSource final : public Executor {
+public:
+    FailingSource(QueryContext& q, bool during_init, bool allocation)
+        : Executor(q), during_init_(during_init), allocation_(allocation), schema_(Base()) {}
+    ~FailingSource() noexcept override { Close(); }
+    const Schema& OutputSchema() const override { return schema_; }
+    Ordering OutputOrdering() const override { return {}; }
+    bool Released() const { return !writer_ && !reader_; }
+private:
+    void DoInit() override {
+        writer_ = std::make_unique<TempWriter>(context_.Temps(), schema_);
+        writer_->Append(Row(0));
+        if (during_init_) Fail(); // An unfinished writer must close before scratch reset.
+        const auto run = writer_->Finish();
+        writer_.reset();
+        reader_ = std::make_unique<TempReader>(run);
+    }
+    bool DoNext(Tuple& out) override {
+        if (reader_->Next(out)) return true;
+        Fail(); // An emitted prefix must not turn this exception into normal EOF.
+    }
+    void DoClose() noexcept override { reader_.reset(); writer_.reset(); }
+    [[noreturn]] void Fail() const {
+        if (allocation_) throw std::bad_alloc();
+        throw std::length_error("native execution failure");
+    }
+    bool during_init_, allocation_;
+    Schema schema_;
+    std::unique_ptr<TempWriter> writer_;
+    std::unique_ptr<TempReader> reader_;
+};
+
+void CentralFailureCleanup() {
+    for (bool during_init : {false, true}) for (bool allocation : {false, true}) {
+        Files files;
+        Database db(files.db, OpenMode::CreateNew, files.temp, 8);
+        QueryContext query(db);
+        auto source = std::make_unique<FailingSource>(query, during_init, allocation);
+        auto* inspect = source.get();
+        Projection root(query, {{0}}, std::move(source));
+        bool caught = false;
+        try {
+            root.Init();
+            Tuple row({});
+            VDB_CHECK(root.Next(row) && row.value(0).as_int64() == 0);
+            root.Next(row);
+        } catch (const std::bad_alloc&) { VDB_CHECK(allocation); caught = true; }
+          catch (const std::length_error&) { VDB_CHECK(!allocation); caught = true; }
+        VDB_CHECK(caught && inspect->Released() && !root.Exhausted());
+        Throws([&] { query.FinishQuery(root); });
+        Tuple row({}); Throws([&] { root.Next(row); });
+        // No caller-side root.Close: common entry points already closed the tree.
+        query.Close();
+        VDB_CHECK(!query.Succeeded());
+        CleanScratch(db, files);
+        db.CreateTable("after_cleanup", Base());
+        db.Close();
+    }
+}
+
 Schema WideSchema() {
     std::vector<Column> columns;
     for (int i = 0; i < 7; ++i) columns.push_back({"v", TypeId::Varchar, 256});
@@ -494,15 +557,15 @@ void MemoryModel() {
     VDB_CHECK(CheckedMultiply(huge, 0) == 0);
     QueryResources resources;
     const auto first = ResolveBudget(resources), second = ResolveBudget(resources);
-    VDB_CHECK(first.max_bytes == 1024 * 1024 && second.max_bytes == first.max_bytes);
-    VDB_CHECK(first.max_bytes + second.max_bytes > resources.work_memory_bytes);
+    VDB_CHECK(first == 1024 * 1024 && second == first);
+    VDB_CHECK(first + second > resources.work_memory_bytes);
     VDB_CHECK(resources.max_temp_pages == 16384);
-    VDB_CHECK(ResolveBudget(resources, 256 * 1024).max_bytes == 256 * 1024);
+    VDB_CHECK(ResolveBudget(resources, 256 * 1024) == 256 * 1024);
     Throws([&] { ResolveBudget(resources, 0); });
     Throws([&] { ResolveBudget(QueryResources{0, 1}); });
     Throws([&] { QueryResources{1, 0}.Validate(); });
     if (huge > kInvalidPageId) Throws([&] { QueryResources{1, huge}.Validate(); });
-    VDB_CHECK(ResolveBudget(QueryResources{1, 1}).max_bytes == 1);
+    VDB_CHECK(ResolveBudget(QueryResources{1, 1}) == 1);
     ValidateInt64Key(narrow, 0);
     Throws([&] { ValidateInt64Key(narrow, 1); });
     Throws([&] { ValidateInt64Key(varchar, 0); });
@@ -540,7 +603,7 @@ void EmptyAndSingleTemp() {
     auto empty = writer.Finish(); Pins(db);
     VDB_CHECK(&empty.OutputSchema() == &schema);
     VDB_CHECK(empty.FirstPage() == kInvalidPageId && empty.LastPage() == kInvalidPageId);
-    VDB_CHECK(empty.RowCount() == 0 && empty.PageCount() == 0 && empty.ModeledRowBytes() == 0);
+    VDB_CHECK(empty.RowCount() == 0 && empty.PageCount() == 0);
     Throws([&] { writer.Append(Row(0)); });
     Throws([&] { writer.Finish(); });
     writer.Close(); writer.Close();
@@ -558,7 +621,6 @@ void EmptyAndSingleTemp() {
     auto single = append.Finish(); Pins(db);
     VDB_CHECK(single.PageCount() == 1 && single.RowCount() == 4);
     VDB_CHECK(single.FirstPage() == 0 && single.LastPage() == 0);
-    VDB_CHECK(single.ModeledRowBytes() == 4 * RowMemoryCharge(schema));
     {
         auto guard = db.Buffer().Fetch({FileKind::Temporary, 0});
         SlottedPage::Validate(guard.Data(), 0, kInvalidPageId);
@@ -600,7 +662,7 @@ void MultiPageTemp() {
     auto relation = writer.Finish(); Pins(db);
     VDB_CHECK(relation.PageCount() > 8 && relation.RowCount() == 600);
     VDB_CHECK(db.Metrics().dirty_evictions > 0);
-    VDB_CHECK(query.Temps().Metrics().peak_temp_extent_pages == relation.PageCount());
+    VDB_CHECK(query.Temps().Metrics().allocated_temp_pages == relation.PageCount());
     size_t pages = 0, slots = 0;
     PageId id = relation.FirstPage();
     while (id != kInvalidPageId) {
@@ -888,7 +950,7 @@ void TempIoErrors() {
         Throws([&] { writer.Finish(); });
         Pins(db); query.Close(); CleanScratch(db, files);
     }
-    // Validate row counts and page format independently of the descriptor API.
+    // Page identity/type and accessed payload bounds remain mandatory.
     for (int corruption = 0; corruption < 3; ++corruption) {
         QueryContext query(db);
         TempWriter writer(query.Temps(), schema);
@@ -897,9 +959,8 @@ void TempIoErrors() {
         {
             auto page = db.Buffer().Fetch({FileKind::Temporary, run.FirstPage()});
             if (corruption == 0) page.MutableData().fill(std::byte{0});
-            if (corruption == 1) VDB_CHECK(SlottedPage::Erase(page.MutableData(), 0));
-            if (corruption == 2)
-                VDB_CHECK(SlottedPage::Insert(page.MutableData(), EncodeTuple(schema, Row(1))));
+            if (corruption == 1) WriteU16(page.MutableData(), SlottedPage::kHeaderSize, kPageSize - 1);
+            if (corruption == 2) WriteU16(page.MutableData(), SlottedPage::kHeaderSize + 2, kPageSize);
             page.MarkDirty();
         }
         TempReader reader(run);
@@ -923,7 +984,7 @@ void TempIoErrors() {
     db.Close();
 }
 
-void FailedAllocationStillCounts() {
+void FailedAllocationConsumesCap() {
     Files files;
     Database db(files.db, OpenMode::CreateNew, files.temp, 8);
     Populate(db);
@@ -934,9 +995,8 @@ void FailedAllocationStillCounts() {
     TempWriter writer(query.Temps(), schema);
     Throws([&] { writer.Append(Row(0)); }); // BufferPool allocates before finding all frames pinned.
     VDB_CHECK(db.Disk().PageCount(FileKind::Temporary) == 1);
-    VDB_CHECK(query.Temps().Metrics().allocated_temp_pages == 1);
-    VDB_CHECK(query.Temps().Metrics().current_temp_extent_pages == 1);
-    VDB_CHECK(query.Temps().Metrics().peak_temp_extent_pages == 1);
+    VDB_CHECK(query.Temps().Metrics().allocated_temp_pages == 0);
+    VDB_CHECK(query.Db().Disk().PageCount(FileKind::Temporary) == 1);
     Throws([&] { writer.Finish(); }); // No descriptor can escape the failed allocation.
     external_pins.clear();
     VDB_CHECK(db.Metrics().active_pins == 0);
@@ -945,7 +1005,7 @@ void FailedAllocationStillCounts() {
     Throws([&] { retry.Append(Row(1)); }); // The physical orphan still consumes the cap.
     VDB_CHECK(db.Disk().PageCount(FileKind::Temporary) == 1);
     writer.Close(); query.Close();
-    VDB_CHECK(query.Temps().Metrics().current_temp_extent_pages == 0);
+    VDB_CHECK(query.Db().Disk().PageCount(FileKind::Temporary) == 0);
     VDB_CHECK(db.Metrics().active_pins == 0);
     VDB_CHECK(std::filesystem::file_size(files.temp) == 0);
     db.Close();
@@ -971,11 +1031,12 @@ int main(int argc, char** argv) {
         {"index_scans", IndexScans}, {"index_corruption", IndexCorruption},
         {"filters", Filters}, {"projections_pipelines", ProjectionsAndPipelines},
         {"query_boundaries", QueryBoundaries}, {"execution_failures", ExecutionFailures},
+        {"central_failure_cleanup", CentralFailureCleanup},
         {"memory_model", MemoryModel}, {"empty_single_temp", EmptyAndSingleTemp},
         {"multi_page_temp", MultiPageTemp}, {"interleaved_values", InterleavedTempValues},
         {"temp_cap", TempCapAndAbandonment}, {"safe_reset_failure", SafeResetAndFailure},
         {"pinned_reset", PinnedReset}, {"temp_io_errors", TempIoErrors},
-        {"allocation_failure", FailedAllocationStillCounts}, {"startup_failure", StartupResetFailure}};
+        {"allocation_failure", FailedAllocationConsumesCap}, {"startup_failure", StartupResetFailure}};
     try {
         for (const auto& [name, run] : tests) {
             if (argc > 1 && name.find(argv[1]) == std::string::npos) continue;

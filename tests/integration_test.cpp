@@ -37,7 +37,7 @@ void Throws(const std::function<void()>& run, const std::string& message) {
 void Clean(QueryContext& q) {
     VDB_CHECK(q.Db().Metrics().active_pins == 0);
     VDB_CHECK(q.Db().Disk().PageCount(FileKind::Temporary) == 0);
-    VDB_CHECK(q.Temps().Metrics().current_temp_extent_pages == 0);
+    VDB_CHECK(q.Db().Disk().PageCount(FileKind::Temporary) == 0);
     for (const auto& f : q.Db().Buffer().InspectFrames())
         VDB_CHECK(!f.page || f.page->file != FileKind::Temporary);
 }
@@ -262,18 +262,17 @@ public:
     OnceScan(QueryContext& q, const std::string& table, Consumption& counts)
         : Executor(q), scan_(q, SeqScanPlan{table, true}), counts_(counts) {}
     ~OnceScan() noexcept override { Close(); }
-    void Init() override {
+    void DoInit() override {
         VDB_CHECK(counts_.inits++ == 0);
-        Start(); scan_.Init();
+        scan_.Init();
     }
-    bool Next(Tuple& row) override {
-        VDB_CHECK(Ready());
+    bool DoNext(Tuple& row) override {
         ++counts_.calls;
-        if (!scan_.Next(row)) return End();
+        if (!scan_.Next(row)) return false;
         ++counts_.rows;
         return true;
     }
-    void Close() noexcept override { scan_.Close(); CloseState(); }
+    void DoClose() noexcept override { scan_.Close(); }
     const Schema& OutputSchema() const override { return scan_.OutputSchema(); }
     Ordering OutputOrdering() const override { return {}; }
 private:
@@ -394,7 +393,7 @@ void TempMetricsAndReset() {
     VDB_CHECK(db.Metrics().buffer_fetches == fetches + 1); // One staged read, including EOF.
     { auto copy = a; VDB_CHECK(copy.RowCount() == 1); }
     VDB_CHECK(db.Metrics().buffer_fetches == fetches + 1); // No release traversal.
-    VDB_CHECK(q.Temps().Metrics().current_temp_extent_pages == 1);
+    VDB_CHECK(q.Db().Disk().PageCount(FileKind::Temporary) == 1);
     TempWriter wb(q.Temps(), schema);
     wb.Append(Tuple({Value(int64_t{3}), Value(int64_t{4}), Value(std::string())})); auto b = wb.Finish();
     VDB_CHECK(b.FirstPage() == 1);
@@ -402,11 +401,11 @@ void TempMetricsAndReset() {
     SeqScan root(q, {"empty"}); root.Init(); Tuple row({}); VDB_CHECK(!root.Next(row));
     db.Disk().FailNextIo(FailNext::ResetTemporary);
     Throws([&] { q.FinishQuery(root); }, "reset");
-    VDB_CHECK(!q.Succeeded() && q.Temps().Metrics().current_temp_extent_pages == 2);
+    VDB_CHECK(!q.Succeeded() && q.Db().Disk().PageCount(FileKind::Temporary) == 2);
     for (const auto& frame : db.Buffer().InspectFrames()) VDB_CHECK(!frame.page || frame.page->file != FileKind::Temporary);
     Throws([&] { QueryContext another(db); }, "active query");
     q.Close(); Clean(q);
-    VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 2 && q.Temps().Metrics().peak_temp_extent_pages == 2);
+    VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 2);
     QueryContext next(db); VDB_CHECK(next.Temps().Metrics().allocated_temp_pages == 0);
     next.Close(); Clean(next); db.Close();
 }
@@ -426,7 +425,7 @@ void PrefixFailure() {
     size_t emitted = 0; Tuple row({});
     Throws([&] { while (join.Next(row)) ++emitted; }, "temporary page cap");
     VDB_CHECK(emitted == 141 && !join.Exhausted()); // First inner execution completed; replay cannot allocate.
-    VDB_CHECK(!q.Succeeded() && q.Temps().Metrics().current_temp_extent_pages == 4);
+    VDB_CHECK(!q.Succeeded() && q.Db().Disk().PageCount(FileKind::Temporary) == 4);
     join.Close(); join.Close();
     Throws([&] { q.FinishQuery(join); }, "EOF");
     q.Close(); Clean(q); VDB_CHECK(!q.Succeeded());

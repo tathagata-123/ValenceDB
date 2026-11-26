@@ -40,17 +40,6 @@ const Schema& AggregateInput(QueryContext& context, const std::unique_ptr<Execut
     if (!child || &child->Context() != &context) throw DbError("aggregate child must belong to this query");
     return child->OutputSchema();
 }
-AggregateMemory MemoryFor(const QueryResources& resources, std::optional<size_t> bytes,
-                          size_t maximum_row_bytes) {
-    AggregateMemory m;
-    m.max_bytes = ResolveBudget(resources, bytes).max_bytes;
-    m.maximum_row_bytes = maximum_row_bytes;
-    m.scratch_bytes = FixedScratchCharge(maximum_row_bytes);
-    m.combine_bytes = CheckedAdd(CheckedMultiply(3, maximum_row_bytes), 1024);
-    // Global and ordered streaming need only combine scratch, with no staging pages.
-    RemainingMemory(m.max_bytes, m.combine_bytes);
-    return m;
-}
 int64_t Measure(const Tuple& row, const AggregateSpec& s) {
     return NeedsMeasure(s) ? row.value(*s.measure_column).as_int64() : 0;
 }
@@ -124,24 +113,6 @@ void AggregateState::Combine(const AggregateState& partial, const AggregateSpec&
     if (NeedsMeasure(s)) has_value = has_value || partial.has_value;
 }
 
-AggregateMemory ComputeHashAggregateMemory(const QueryResources& resources, const Schema& input,
-    const Schema& output, bool grouped, std::optional<size_t> bytes) {
-    auto m = MemoryFor(resources, bytes, std::max({RowMemoryCharge(input), RowMemoryCharge(output),
-        grouped ? RowMemoryCharge(AggregatePartialSchema()) : size_t{0}}));
-    if (!grouped) return m;
-    if (m.max_bytes <= m.scratch_bytes) throw DbError("hash aggregate cannot cover scratch");
-    m.hash_group_capacity = RemainingMemory(m.max_bytes, m.scratch_bytes) / kAggregateGroupCharge;
-    if (!m.hash_group_capacity || m.hash_group_capacity > std::unordered_map<int64_t, AggregateState>().max_size())
-        throw DbError("hash aggregate group capacity is zero or unrepresentable");
-    m.sort_memory_bytes = RemainingMemory(m.max_bytes, CheckedAdd(m.combine_bytes, kPageSize));
-    return m;
-}
-AggregateMemory ComputeSortAggregateMemory(const QueryResources& resources, const Schema& input,
-    const Schema& output, bool needs_sort, std::optional<size_t> bytes) {
-    auto m = MemoryFor(resources, bytes, std::max(RowMemoryCharge(input), RowMemoryCharge(output)));
-    if (needs_sort) m.sort_memory_bytes = RemainingMemory(m.max_bytes, m.combine_bytes);
-    return m;
-}
 
 HashAggregate::HashAggregate(QueryContext& context, AggregateSpec spec,
     std::unique_ptr<Executor> child, std::optional<size_t> bytes)
@@ -194,63 +165,51 @@ void HashAggregate::FlushBatch(Table& groups, TempWriter& writer) {
     groups.clear(); // Reuse reserved buckets only within BuildGroups.
 }
 
-void HashAggregate::Init() {
-    Start();
-    try {
-        metrics_ = {};
-        global_ = {};
-        child_->Init();
-        if (!spec_.group_column) {
-            global_ = ConsumeGlobal(*child_, spec_, metrics_);
-            phase_ = Phase::EmitGlobal;
-            return;
-        }
-        const auto partials = BuildGroups();
-        if (!partials) {
-            position_ = table_->cbegin();
-            phase_ = Phase::EmitHash;
-            return;
-        }
-        // BuildGroups has released all build allocations before sorting starts.
-        assert(!table_);
-        // TempScan owns a staging page outside ExternalSort's reduced budget.
-        sort_ = std::make_unique<ExternalSort>(context_, ExternalSortPlan{0, memory_.sort_memory_bytes},
-            std::make_unique<TempScan>(context_, *partials));
-        metrics_.used_internal_sort = true;
-        sort_->Init();
-        metrics_.sort = sort_->Metrics();
-        phase_ = Phase::CombinePartials;
-    } catch (const std::bad_alloc&) {
-        Close(); throw DbError("hash aggregate memory allocation failed");
-    } catch (const std::length_error&) {
-        Close(); throw DbError("hash aggregate allocation size is unrepresentable");
-    } catch (...) { Close(); throw; }
+void HashAggregate::DoInit() {
+    metrics_ = {};
+    global_ = {};
+    child_->Init();
+    if (!spec_.group_column) {
+        global_ = ConsumeGlobal(*child_, spec_, metrics_);
+        phase_ = Phase::EmitGlobal;
+        return;
+    }
+    const auto partials = BuildGroups();
+    if (!partials) {
+        position_ = table_->cbegin();
+        phase_ = Phase::EmitHash;
+        return;
+    }
+    // BuildGroups has released all build allocations before sorting starts.
+    assert(!table_);
+    // TempScan owns a staging page outside ExternalSort's reduced budget.
+    sort_ = std::make_unique<ExternalSort>(context_, ExternalSortPlan{0, memory_.sort_memory_bytes},
+        std::make_unique<TempScan>(context_, *partials));
+    metrics_.used_internal_sort = true;
+    sort_->Init();
+    metrics_.sort = sort_->Metrics();
+    phase_ = Phase::CombinePartials;
 }
 
-bool HashAggregate::Next(Tuple& out) {
-    if (!Ready()) return false;
-    try {
-        if (phase_ == Phase::EmitGlobal) {
-            out = Finalize(0, global_, spec_);
-            phase_ = Phase::Done;
-        } else if (phase_ == Phase::EmitHash && position_ != table_->cend()) {
-            out = Finalize(position_->first, position_->second, spec_);
-            ++position_;
-        } else if (phase_ == Phase::CombinePartials &&
-                   NextGroup(*sort_, spec_, true, lookahead_, metrics_, out)) {
-            // One combined output only; the boundary partial remains in lookahead_.
-        } else {
-            phase_ = Phase::Done;
-            return End();
-        }
-        ++metrics_.output_groups;
-        return true;
-    } catch (const std::bad_alloc&) {
-        Close(); throw DbError("hash aggregate memory allocation failed");
-    } catch (...) { Close(); throw; }
+bool HashAggregate::DoNext(Tuple& out) {
+    if (phase_ == Phase::EmitGlobal) {
+        out = Finalize(0, global_, spec_);
+        phase_ = Phase::Done;
+    } else if (phase_ == Phase::EmitHash && position_ != table_->cend()) {
+        out = Finalize(position_->first, position_->second, spec_);
+        ++position_;
+    } else if (phase_ == Phase::CombinePartials &&
+               NextGroup(*sort_, spec_, true, lookahead_, metrics_, out)) {
+        // One combined output only; the boundary partial remains in lookahead_.
+    } else {
+        phase_ = Phase::Done;
+        return false;
+    }
+    ++metrics_.output_groups;
+    return true;
 }
 
-void HashAggregate::Close() noexcept {
+void HashAggregate::DoClose() noexcept {
     child_->Close();
     if (sort_) metrics_.sort = sort_->Metrics();
     sort_.reset(); // Destroys TempScan and its reader.
@@ -259,7 +218,6 @@ void HashAggregate::Close() noexcept {
     lookahead_.reset();
     global_ = {};
     phase_ = Phase::Closed;
-    CloseState();
 }
 
 SortAggregate::SortAggregate(QueryContext& context, AggregateSpec spec,
@@ -274,44 +232,33 @@ SortAggregate::SortAggregate(QueryContext& context, AggregateSpec spec,
     }
 }
 
-void SortAggregate::Init() {
-    Start();
-    try {
-        metrics_ = {};
-        global_emitted_ = false;
-        metrics_.used_internal_sort = memory_.sort_memory_bytes != 0;
-        metrics_.input_order_reused = spec_.group_column.has_value() && !metrics_.used_internal_sort;
-        input_->Init();
-        // A nonzero sort budget means construction wrapped input_ in exactly one ExternalSort.
-        if (metrics_.used_internal_sort) metrics_.sort = static_cast<ExternalSort&>(*input_).Metrics();
-    } catch (const std::bad_alloc&) {
-        Close(); throw DbError("sort aggregate memory allocation failed");
-    } catch (...) { Close(); throw; }
+void SortAggregate::DoInit() {
+    metrics_ = {};
+    global_emitted_ = false;
+    metrics_.used_internal_sort = memory_.sort_memory_bytes != 0;
+    metrics_.input_order_reused = spec_.group_column.has_value() && !metrics_.used_internal_sort;
+    input_->Init();
+    // A nonzero sort budget means construction wrapped input_ in exactly one ExternalSort.
+    if (metrics_.used_internal_sort) metrics_.sort = static_cast<ExternalSort&>(*input_).Metrics();
 }
 
-bool SortAggregate::Next(Tuple& out) {
-    if (!Ready()) return false;
-    try {
-        if (!spec_.group_column) {
-            if (global_emitted_) return End();
-            out = Finalize(0, ConsumeGlobal(*input_, spec_, metrics_), spec_);
-            global_emitted_ = true;
-        } else if (!NextGroup(*input_, spec_, false, lookahead_, metrics_, out)) {
-            return End();
-        }
-        ++metrics_.output_groups;
-        return true;
-    } catch (const std::bad_alloc&) {
-        Close(); throw DbError("sort aggregate memory allocation failed");
-    } catch (...) { Close(); throw; }
+bool SortAggregate::DoNext(Tuple& out) {
+    if (!spec_.group_column) {
+        if (global_emitted_) return false;
+        out = Finalize(0, ConsumeGlobal(*input_, spec_, metrics_), spec_);
+        global_emitted_ = true;
+    } else if (!NextGroup(*input_, spec_, false, lookahead_, metrics_, out)) {
+        return false;
+    }
+    ++metrics_.output_groups;
+    return true;
 }
 
-void SortAggregate::Close() noexcept {
+void SortAggregate::DoClose() noexcept {
     input_->Close(); // Keep the sorter/child tree for legal whole-execution replay.
     if (metrics_.used_internal_sort) metrics_.sort = static_cast<ExternalSort&>(*input_).Metrics();
     lookahead_.reset();
     global_emitted_ = false;
-    CloseState();
 }
 
 }  // namespace valencedb

@@ -15,13 +15,11 @@ QueryContext::~QueryContext() noexcept {
     try { Close(); } catch (...) { /* Explicit checked cleanup is the error-reporting path. */ }
 }
 void QueryContext::CheckActive() const {
-    if (!active_) throw DbError("query context is closed");
+    temps_.CheckActive();
 }
 void QueryContext::Close() {
-    if (!active_) return;
-    if (open_executors_ != 0) throw DbError("close executors before query cleanup");
+    if (!temps_.active_) return;
     temps_.Reset();
-    active_ = false;
     db_.query_active_ = false;
 }
 void QueryContext::FinishQuery(Executor& root) {
@@ -31,20 +29,27 @@ void QueryContext::FinishQuery(Executor& root) {
     Close();
     succeeded_ = true;
 }
-void Executor::Start() {
+void Executor::Init() {
     context_.CheckActive();
     if (initialized_) throw DbError("executor Init requires Close before replay");
     initialized_ = true;
     eof_ = false;
-    ++context_.open_executors_;
+    ++context_.temps_.open_resources_;
+    try { DoInit(); }
+    catch (...) { Close(); throw; }
 }
-bool Executor::Ready() const {
-    context_.CheckActive();
+bool Executor::Next(Tuple& out) {
     if (!initialized_) throw DbError("executor Next requires Init");
-    return !eof_;
+    if (eof_) return false;
+    try {
+        eof_ = !DoNext(out);
+        return !eof_;
+    } catch (...) { Close(); throw; }
 }
-void Executor::CloseState() noexcept {
-    if (initialized_) --context_.open_executors_;
+void Executor::Close() noexcept {
+    if (!initialized_) return;
+    DoClose(); // Children and temporary handles close before the reset guard drops.
+    --context_.temps_.open_resources_;
     initialized_ = false;
 }
 

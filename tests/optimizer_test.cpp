@@ -705,7 +705,7 @@ void MemoryAndCost() {
             auto hash = ComputeHashAggregateMemory(resources, schema, output, true);
             VDB_CHECK(hash.scratch_bytes == 8192 + 3 * std::max(t, size_t{360}) + 1024);
             VDB_CHECK(hash.hash_group_capacity == (memory - hash.scratch_bytes) / 192);
-            VDB_CHECK(hash.sort_memory_bytes == memory - hash.combine_bytes - 4096);
+            VDB_CHECK(hash.sort_memory_bytes == memory - hash.combine_bytes - kPageSize - kTempHandleOverhead);
             auto stream = ComputeSortAggregateMemory(resources, schema, output, true);
             VDB_CHECK(stream.sort_memory_bytes == memory - stream.combine_bytes);
         }
@@ -793,7 +793,7 @@ void PlanStructure() {
             VDB_CHECK(db.Metrics().active_pins == 0);
         }
         q.Close();
-        VDB_CHECK(q.Temps().Metrics().current_temp_extent_pages == 0);
+        VDB_CHECK(q.Db().Disk().PageCount(FileKind::Temporary) == 0);
         VDB_CHECK(db.Disk().PageCount(FileKind::Temporary) == 0);
     }
     // Ordered input needs no sorter even after Filter/Projection; final projection can drop the key.

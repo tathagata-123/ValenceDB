@@ -20,13 +20,13 @@ public:
     NestedLoopJoin(QueryContext& context, JoinPlan plan,
                    std::unique_ptr<Executor> left, std::unique_ptr<Executor> right);
     ~NestedLoopJoin() noexcept override { Close(); }
-    void Init() override;
-    bool Next(Tuple& out) override;
-    void Close() noexcept override;
     const Schema& OutputSchema() const override { return schema_; }
     Ordering OutputOrdering() const override { return {}; }
     const NestedLoopJoinMetrics& Metrics() const noexcept { return metrics_; }
 private:
+    void DoInit() override;
+    bool DoNext(Tuple& out) override;
+    void DoClose() noexcept override;
     JoinPlan plan_;
     std::unique_ptr<Executor> outer_, inner_;
     Schema schema_;

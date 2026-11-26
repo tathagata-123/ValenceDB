@@ -329,7 +329,7 @@ Json Algorithm(Executor& root, const Schema& input, const QueryResources& resour
 #define GM(field) j.Number(#field, m.field)
         GM(hash_pairs); GM(fallback_pairs); GM(empty_pairs); GM(left_build_pairs); GM(right_build_pairs);
         GM(peak_build_rows); GM(modeled_peak_build_bytes); GM(output_rows); GM(peak_partition_writers);
-        GM(left_fallback_pairs); GM(right_fallback_pairs); GM(completed_fallback_inner_scans); GM(failed_build_rows);
+        GM(left_fallback_pairs); GM(right_fallback_pairs); GM(completed_fallback_inner_scans);
 #undef GM
         Require(m.output_rows == count, "GHJ counter mismatch");
     } else {
@@ -387,8 +387,7 @@ void Counters(Json& record, Database& db, const BufferMetrics& before, const IoC
     record.Object("buffer", b); record.Object("file_io", f);
 }
 void CheckReset(Database& db, QueryContext& context) {
-    Require(context.Succeeded() && db.Disk().PageCount(FileKind::Temporary) == 0 &&
-            context.Temps().Metrics().current_temp_extent_pages == 0, "scratch reset failed");
+    Require(context.Succeeded() && db.Disk().PageCount(FileKind::Temporary) == 0, "scratch reset failed");
     for (const auto& frame : db.Buffer().InspectFrames()) {
         Require(frame.pin_count == 0, "pin remains after FinishQuery");
         Require(!frame.page || frame.page->file != FileKind::Temporary, "stale temporary cache mapping");
@@ -502,7 +501,7 @@ void RunQueries(const Config& c, Database& db, const std::vector<QuerySpec>& que
     const QueryResources resources{c.memory, c.temp_limit}; const auto options = Options(c);
     const auto before = db.Metrics(); const auto io_before = db.Disk().counters();
     double elapsed = 0;
-    size_t allocated = 0, before_reset = 0, peak_extent = 0, relations = 0;
+    size_t allocated = 0, relations = 0;
     std::string plans = "[", explains;
     for (size_t i = 0; i < queries.size(); ++i) {
         // Includes context startup, physical planning/construction, Init, all Next,
@@ -522,16 +521,14 @@ void RunQueries(const Config& c, Database& db, const std::vector<QuerySpec>& que
         plans += physical.Dump();
         explains += "query " + std::to_string(i) + "\n" + Explain(plan) + "\n";
         record.Object("algorithm", Algorithm(*plan.root, schema, resources, sink.count - previous_count));
-        allocated += temp.allocated_temp_pages; before_reset += temp.current_temp_extent_pages;
-        peak_extent = std::max(peak_extent, temp.peak_temp_extent_pages); relations += temp.temp_relations_created;
+        allocated += temp.allocated_temp_pages; relations += temp.temp_relations_created;
     }
     record.Real("elapsed_ms", elapsed); record.fields["physical_plans"] = plans + ']';
     record.String("explain", explains); record.Number("query_count", queries.size());
     record.String("timing_boundary", "sum(context + planning/construction + Init + Next through EOF + digest/order + FinishQuery)");
     record.Bool("finish_query_succeeded", true); record.Bool("order_verified", true);
     Json temp;
-    temp.Number("allocated_temp_pages", allocated); temp.Number("extent_before_reset_sum", before_reset);
-    temp.Number("peak_extent_pages", peak_extent); temp.Number("extent_after_reset", 0);
+    temp.Number("allocated_temp_pages", allocated); temp.Number("extent_after_reset", 0);
     temp.Number("temp_relations_created", relations); temp.Number("temporary_pins_after", 0);
     temp.Number("temporary_cached_pages_after", 0); record.Object("scratch", temp);
     Counters(record, db, before, io_before);
@@ -568,7 +565,7 @@ void Metadata(Database& db, Json& record) {
 }
 void NoScratch(Json& record) {
     Json s;
-    for (const auto& name : {"allocated_temp_pages", "extent_before_reset_sum", "peak_extent_pages",
+    for (const auto& name : {"allocated_temp_pages",
              "extent_after_reset", "temporary_pins_after", "temporary_cached_pages_after"}) s.Number(name, 0);
     record.Object("scratch", s);
     record.fields["finish_query_succeeded"] = "null";
@@ -716,7 +713,7 @@ void Run(const Config& c, Json& record, std::string& stage) {
 
 int main(int argc, char** argv) {
     Config c; Json record; std::string stage = "cli";
-    record.Number("schema_version", 4); record.Bool("success", false);
+    record.Number("schema_version", 5); record.Bool("success", false);
     record.String("build_type", VALENCEDB_BENCH_BUILD_TYPE);
     record.String("compiler", VALENCEDB_BENCH_COMPILER);
     record.String("platform", VALENCEDB_BENCH_PLATFORM);

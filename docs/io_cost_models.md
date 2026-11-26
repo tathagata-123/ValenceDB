@@ -6,7 +6,7 @@ ValenceDB reports algorithmic work, buffer activity, and file operations separat
 
 - `BufferPool::metrics()` (also `Database::Metrics()`) starts at pool construction and accumulates through queries and checked database close. Reopening constructs a new pool. `active_pins` is a current gauge; `peak_pins` is a lifetime high-water mark.
 - `DiskManager::counters()` starts at DiskManager construction. Scratch reset does not reset these counters. Reopening creates new counters.
-- `QueryContext::Temps().Metrics()` starts with each context. Allocated pages, peak extent, and relation creations remain historical after cleanup. Current extent becomes zero only after successful scratch reset.
+- `QueryContext::Temps().Metrics()` starts with each context. Successful page allocations and writer constructions remain historical after cleanup. Current extent is read from DiskManager and becomes zero only after successful scratch reset.
 - Operator `Metrics()` resets at each `Init()` that starts an execution and survives `Close()`. Rejected duplicate Init does not reset the live execution. Aggregate internal-sort metrics are snapshots after sort Init and at aggregate Close.
 
 Accessors return const references to live counters. Copy the small struct for a stable snapshot; subtract cumulative counters for interval work. Do not subtract peaks to infer an interval peak. There is no global reset or generic telemetry registry.
@@ -39,7 +39,7 @@ Textbook pass formulas and optimizer estimates omit allocation initialization. K
 
 ## Query scratch extent
 
-`allocated_temp_pages` is the cumulative physical allocation count for this query, including NewPage allocations whose frame acquisition failed. `current_temp_extent_pages` is the current append-only extent at allocation/reset boundaries. `peak_temp_extent_pages` is its historical maximum. During a query all three agree; after checked reset current becomes zero and the historical fields survive. `temp_relations_created` counts writer constructions, including empty and abandoned runs; descriptor copies add nothing.
+`allocated_temp_pages` counts successful TempStore NewPage returns. A physical allocation followed by failed frame installation is visible in DiskManager's allocation count and physical extent, but not repaired into TempMetrics. For successful queries these counts agree. The physical `DiskManager::PageCount(Temporary)` supplies current extent and enforces the cap even after failure. The redundant current/peak TempMetrics fields are removed. `temp_relations_created` counts writer constructions, including empty and abandoned runs; descriptor copies add nothing. Both retained counters survive cleanup.
 
 Empty relations allocate no pages. Releasing a relation drops RAM handles without walking the chain, freeing pages, reusing IDs, performing reclamation I/O, or reducing any extent counter. Repeated Close→Init in one context adds to the same extent. The physical extent governs `max_temp_pages`, not the number of live descriptors. Low-level Buffer/Disk APIs must not bypass query-owned scratch allocation/reset.
 
@@ -49,7 +49,7 @@ Successful teardown closes executors and handles, rejects temporary pins, discar
 
 ## Algorithmic work and optimizer costs
 
-The existing specialized counters remain authoritative: sort initial/materialized runs, intermediate passes and streamed final fan-in; BNLJ blocks/scans/comparisons; GHJ partition-pair strategies/build peaks/failed-build rows; and aggregate group peaks/overflow flushes/spill batches/records/output groups. Their exact partial-execution boundaries are in [external_sort.md](external_sort.md), [joins.md](joins.md), and [aggregation.md](aggregation.md). `spill_batches` includes the final nonempty map flush. GHJ fallback inner-scan totals include completed pairs only, with failed build-prefix rows exposed separately.
+The existing specialized counters remain authoritative: sort initial/materialized runs, intermediate passes and streamed final fan-in; BNLJ blocks/scans/comparisons; GHJ partition-pair strategies/build peaks; and aggregate group peaks/overflow flushes/spill batches/records/output groups. Their exact partial-execution boundaries are in [external_sort.md](external_sort.md), [joins.md](joins.md), and [aggregation.md](aggregation.md). `spill_batches` includes the final nonempty map flush. GHJ fallback inner-scan totals include completed pairs only, without a separate failed-build-prefix counter.
 
 The optimizer's `ModeledCost` uses logical pages plus `0.0001 * cpu`, not cache misses or elapsed time. Let N be estimated packed pages, r initial runs, k fan-in, and L materialized intermediate levels (repeated ceil(r/k) reductions until r<=k). Local/subtree accounting is:
 
@@ -63,7 +63,7 @@ The optimizer's `ModeledCost` uses logical pages plus `0.0001 * cpu`, not cache 
 | HashAggregate, spill | Child once + partial writes + partial TempScan reads + reduced-budget partial ExternalSort work + combine CPU |
 | SortAggregate | Actual child once + group CPU + internal reduced-budget sort work only when input is unordered |
 
-SortAggregate local cost includes internal sorting; there is no synthetic sort child. The shared pure sort estimator excludes its input path. Hash partial generation and TempScan reads are charged by the aggregate separately from partial-sort work. Derived capacities and replay counts are formatted on demand, and the planner no longer accumulates diagnostic temporary-extent totals. Runtime scratch metrics and limits are unchanged.
+SortAggregate local cost includes internal sorting; there is no synthetic sort child. The shared pure sort estimator excludes its input path. Hash partial generation and TempScan reads are charged by the aggregate separately from partial-sort work. Derived capacities and replay counts are formatted on demand, and the planner no longer accumulates diagnostic temporary-extent totals. Runtime limits use physical scratch extent; see the allocation counter boundary above.
 
 An indexed/filter/project inner is charged at its selected subtree execution cost, not replaced with raw table pages. Adding all displayed children once to an NLJ/BNLJ subtree would misrepresent replay. A final projection does not add page work. [optimizer.md](optimizer.md) gives exact estimates and feasibility formulas.
 

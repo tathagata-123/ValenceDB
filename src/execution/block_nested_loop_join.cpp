@@ -2,26 +2,9 @@
 #include "join_helpers.hpp"
 #include <algorithm>
 #include <cassert>
-#include <new>
 
 namespace valencedb {
 
-BlockNestedLoopJoinMemory ComputeBlockJoinMemory(const QueryResources& resources,
-    const Schema& outer, const Schema& inner, const Schema& output, std::optional<size_t> memory_bytes) {
-    BlockNestedLoopJoinMemory m{};
-    m.max_bytes = ResolveBudget(resources, memory_bytes).max_bytes;
-    m.outer_row_bytes = RowMemoryCharge(outer);
-    const size_t maximum_row = std::max({m.outer_row_bytes,
-        RowMemoryCharge(inner), RowMemoryCharge(output)});
-    m.scratch_bytes = FixedScratchCharge(maximum_row);
-    if (m.max_bytes <= m.scratch_bytes)
-        throw DbError("block join memory cannot cover scratch");
-    m.block_capacity = RemainingMemory(m.max_bytes, m.scratch_bytes)
-                             / m.outer_row_bytes;
-    if (m.block_capacity == 0 || m.block_capacity > std::vector<Tuple>().max_size())
-        throw DbError("block join capacity is zero or unrepresentable");
-    return m;
-}
 
 BlockNestedLoopJoin::BlockNestedLoopJoin(QueryContext& context, JoinPlan plan,
     std::unique_ptr<Executor> left, std::unique_ptr<Executor> right,
@@ -37,21 +20,12 @@ BlockNestedLoopJoin::BlockNestedLoopJoin(QueryContext& context, JoinPlan plan,
         inner_->OutputSchema(), schema_, memory_bytes);
 }
 
-void BlockNestedLoopJoin::Init() {
-    Start();
-    try {
-        metrics_ = {};
-        block_.reserve(memory_.block_capacity);
-        metrics_.modeled_peak_bytes = CheckedAdd(memory_.scratch_bytes,
-            CheckedMultiply(memory_.block_capacity, memory_.outer_row_bytes));
-        outer_->Init();
-    } catch (const std::bad_alloc&) {
-        Close();
-        throw DbError("block join memory allocation failed");
-    } catch (const std::length_error&) {
-        Close();
-        throw DbError("block join allocation size is unrepresentable");
-    } catch (...) { Close(); throw; }
+void BlockNestedLoopJoin::DoInit() {
+    metrics_ = {};
+    block_.reserve(memory_.block_capacity);
+    metrics_.modeled_peak_bytes = CheckedAdd(memory_.scratch_bytes,
+        CheckedMultiply(memory_.block_capacity, memory_.outer_row_bytes));
+    outer_->Init();
 }
 
 bool BlockNestedLoopJoin::FillBlock() {
@@ -85,40 +59,34 @@ bool BlockNestedLoopJoin::FillBlock() {
     return true;
 }
 
-bool BlockNestedLoopJoin::Next(Tuple& out) {
-    if (!Ready()) return false;
-    try {
-        for (;;) {
-            if (block_.empty() && !FillBlock()) return End();
-            if (!have_inner_) {
-                if (!inner_->Next(inner_row_)) {
-                    inner_->Close();
-                    inner_row_ = Tuple({});
-                    block_.clear();
-                    continue;
-                }
-                have_inner_ = true;
-                position_ = 0;
+bool BlockNestedLoopJoin::DoNext(Tuple& out) {
+    for (;;) {
+        if (block_.empty() && !FillBlock()) return false;
+        if (!have_inner_) {
+            if (!inner_->Next(inner_row_)) {
+                inner_->Close();
+                inner_row_ = Tuple({});
+                block_.clear();
+                continue;
             }
-            while (position_ < block_.size()) {
-                const auto& outer_row = block_[position_++];
-                ++metrics_.candidate_comparisons;
-                if (outer_row.value(outer_key_).as_int64() != inner_row_.value(inner_key_).as_int64())
-                    continue;
-                out = detail::JoinedTuple(outer_row, inner_row_, plan_.outer);
-                ++metrics_.output_rows;
-                return true; // Resume the same inner row at the next block position.
-            }
-            inner_row_ = Tuple({});
-            have_inner_ = false;
+            have_inner_ = true;
+            position_ = 0;
         }
-    } catch (const std::bad_alloc&) {
-        Close();
-        throw DbError("block join memory allocation failed");
-    } catch (...) { Close(); throw; }
+        while (position_ < block_.size()) {
+            const auto& outer_row = block_[position_++];
+            ++metrics_.candidate_comparisons;
+            if (outer_row.value(outer_key_).as_int64() != inner_row_.value(inner_key_).as_int64())
+                continue;
+            out = detail::JoinedTuple(outer_row, inner_row_, plan_.outer);
+            ++metrics_.output_rows;
+            return true; // Resume the same inner row at the next block position.
+        }
+        inner_row_ = Tuple({});
+        have_inner_ = false;
+    }
 }
 
-void BlockNestedLoopJoin::Close() noexcept {
+void BlockNestedLoopJoin::DoClose() noexcept {
     inner_->Close();
     outer_->Close();
     std::vector<Tuple>().swap(block_);
@@ -126,7 +94,6 @@ void BlockNestedLoopJoin::Close() noexcept {
     inner_row_ = Tuple({});
     position_ = 0;
     have_pending_ = outer_exhausted_ = have_inner_ = false;
-    CloseState();
 }
 
 }  // namespace valencedb

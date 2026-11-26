@@ -7,8 +7,6 @@ namespace valencedb {
 
 struct TempMetrics {
     size_t allocated_temp_pages = 0;
-    size_t current_temp_extent_pages = 0;
-    size_t peak_temp_extent_pages = 0;
     size_t temp_relations_created = 0;
 };
 class TempStore {
@@ -18,6 +16,7 @@ public:
     const TempMetrics& Metrics() const noexcept { return metrics_; }
 private:
     friend class QueryContext;
+    friend class Executor;
     friend class TempWriter;
     friend class TempReader;
     TempStore(Database& db, size_t limit) : db_(db), limit_(limit) {}
@@ -26,7 +25,7 @@ private:
     void Reset();
     Database& db_;
     size_t limit_;
-    size_t open_handles_ = 0;
+    size_t open_resources_ = 0; // Initialized executors and open readers/writers.
     TempMetrics metrics_;
     bool active_ = true;
 };
@@ -40,20 +39,19 @@ public:
     PageId LastPage() const noexcept { return last_; }
     size_t RowCount() const noexcept { return rows_; }
     size_t PageCount() const noexcept { return pages_; }
-    size_t ModeledRowBytes() const noexcept { return modeled_bytes_; }
     const Schema& OutputSchema() const noexcept { return *schema_; }
 private:
     friend class TempScan;
     friend class TempWriter;
     friend class TempReader;
     TempRun(TempStore& store, const Schema& schema, PageId first, PageId last,
-            size_t rows, size_t pages, size_t modeled_bytes)
+            size_t rows, size_t pages)
         : store_(&store), schema_(&schema), first_(first), last_(last),
-          rows_(rows), pages_(pages), modeled_bytes_(modeled_bytes) {}
+          rows_(rows), pages_(pages) {}
     TempStore* store_;
     const Schema* schema_;
     PageId first_, last_;
-    size_t rows_, pages_, modeled_bytes_;
+    size_t rows_, pages_;
 };
 
 class TempWriter {
@@ -71,7 +69,7 @@ private:
     TempStore* store_; // Null after completion, failure, or abandonment.
     const Schema& schema_;
     PageId first_ = kInvalidPageId, last_ = kInvalidPageId;
-    size_t rows_ = 0, pages_ = 0, modeled_bytes_ = 0;
+    size_t rows_ = 0, pages_ = 0;
     PageBytes staging_{};
 };
 
@@ -90,7 +88,6 @@ private:
     PageBytes staging_{};
     PageId page_ = kInvalidPageId;
     uint16_t slot_ = 0;
-    size_t pages_read_ = 0, rows_read_ = 0;
     bool loaded_ = false;
 };
 

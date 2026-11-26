@@ -88,23 +88,21 @@ public:
     Source(QueryContext& context, Schema schema, const std::vector<Tuple>& rows, SourceState& state)
         : Executor(context), schema_(std::move(schema)), rows_(rows), state_(state) {}
     ~Source() noexcept override { Close(); }
-    void Init() override {
-        Start();
+    void DoInit() override {
         ++state_.inits;
         if (state_.inits > state_.allowed_inits) { Close(); throw DbError("illegal child replay"); }
         position_ = 0;
     }
-    bool Next(Tuple& out) override {
-        if (!Ready()) return false;
+    bool DoNext(Tuple& out) override {
         Pins(context_.Db());
         ++state_.next_calls;
         if (position_ == state_.fail_at) throw DbError("injected child failure");
-        if (position_ == rows_.size()) return End();
+        if (position_ == rows_.size()) return false;
         out = rows_[position_++];
         ++state_.delivered;
         return true;
     }
-    void Close() noexcept override { CloseState(); }
+    void DoClose() noexcept override { }
     const Schema& OutputSchema() const override { return schema_; }
     Ordering OutputOrdering() const override { return {}; }
 private:
@@ -299,7 +297,7 @@ void MultiplePasses() {
     VDB_CHECK(sort.Metrics().pending_boundary_tuples == 22);
     VDB_CHECK(sort.Metrics().peak_retained_rows == 14 && sort.Metrics().modeled_peak_bytes == 24528);
     const auto pages = q.Temps().Metrics().allocated_temp_pages;
-    VDB_CHECK(pages == 107 && q.Temps().Metrics().peak_temp_extent_pages == pages);
+    VDB_CHECK(pages == 107 && q.Temps().Metrics().allocated_temp_pages == pages);
     VDB_CHECK(q.Temps().Metrics().temp_relations_created == 44);
     Oracle(sort.OutputSchema(), 2, rows, Drain(db, sort));
     VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == pages); // Next never allocates final output.

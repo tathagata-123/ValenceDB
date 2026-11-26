@@ -23,7 +23,7 @@ The optimizer pipeline remains explicit: generate scans → enumerate joins and
 physical orientations → enumerate aggregates → apply required sort/projection →
 select the cheapest feasible complete plan → build executors. One tagged
 `PhysicalPlan` describes each actual operator and carries one resolved memory
-allowance when needed. Shared memory helpers derive capacities locally. A pure
+allowance when needed. Shared memory helpers in work_budget.cpp derive capacities for both optimizer and execution. A pure
 sort estimator charges explicit sorting, aggregate input sorting, and partial-state
 sorting without creating synthetic nodes. SortAggregate owns its internal sorter;
 its plan child is the real input, and its local cost includes the internal sort.
@@ -42,7 +42,7 @@ Database
 caller scope
   ├─ QueryContext (borrows Database)
   │    ├─ QueryResources value
-  │    └─ TempStore (logical scratch lifetime/cap/handle counts)
+  │    └─ TempStore (logical scratch lifetime/cap/resource count)
   └─ OptimizedPlan or caller-owned root Executor
        └─ uniquely owned children and operator working state
 
@@ -82,15 +82,15 @@ T(schema) = round_up_to_8(64 + 32*ncols + 2*max_encoded_row_bytes)
 S = 2*4096 + 3*Tmax + 1024
 ```
 
-`RowMemoryCharge`, `FixedScratchCharge`, and each `Compute*Memory` helper validate arithmetic before reserve subtraction. Hash aggregate's internal sort gets M minus combine scratch and its separately owned TempScan page; unordered SortAggregate subtracts combine scratch. These are educational charges, not allocator inspection. Phase changes destroy large allocations; `clear()` is used only when reuse stays inside the same phase.
+`RowMemoryCharge`, `FixedScratchCharge`, and each `Compute*Memory` helper validate arithmetic before reserve subtraction. Hash aggregate's internal sort gets M minus combine scratch and its separately owned TempScan page and handle allowance; unordered SortAggregate subtracts combine scratch. These are educational charges, not allocator inspection. Phase changes destroy large allocations; `clear()` is used only when reuse stays inside the same phase.
 
 [ExternalSort](external_sort.md), [joins](joins.md), and [aggregation](aggregation.md) derive the capacities. [I/O cost models](io_cost_models.md) separates logical passes, BufferPool requests, misses, file reads/writes, initialization, and unmeasured device activity. Relation release performs no reclamation I/O and never subtracts historical scratch extent.
 
 ## Completion and failures
 
-`QueryContext::FinishQuery` requires observed root EOF, closes the tree, and calls checked context cleanup. `TempStore::Reset` rejects open readers/writers, `DiscardTemporaryPages` checks pins and discards mappings, and only then does `DiskManager::ResetTemporary` truncate/reopen scratch. Success is recorded after all these steps succeed. Closed executor objects may still exist; their working handles must be gone.
+`QueryContext::FinishQuery` requires observed root EOF, closes the tree, and calls checked context cleanup. `TempStore::Reset` rejects any initialized executor or open reader/writer using one shared resource count, `DiscardTemporaryPages` checks pins and discards mappings, and only then does `DiskManager::ResetTemporary` truncate/reopen scratch. Success is recorded after all these steps succeed. Closed executor objects may still exist; their working handles must be gone.
 
-For cancellation, close the tree/handles then call `QueryContext::Close`; cancellation never records success. `Next()==false` means EOF, never error. Any execution error invalidates the whole emitted prefix. Unexpected structural I/O failure may leave heap/index state uncertain: propagate the error and abandon the instance (stream errors are `DbError`; filesystem operations may throw `std::filesystem::filesystem_error`). There is no WAL, transaction rollback, poisoned-handle framework, or crash recovery.
+For cancellation, close the tree/handles then call `QueryContext::Close`; cancellation never records success. `Next()==false` means EOF, never error. Common Executor Init/Next entry points close failed subtrees and propagate original exceptions, including native allocation/length errors. Any execution error invalidates the whole emitted prefix. Unexpected structural I/O failure may leave heap/index state uncertain: propagate the error and abandon the instance (stream errors are `DbError`; filesystem operations may throw `std::filesystem::filesystem_error`). There is no WAL, transaction rollback, poisoned-handle framework, or crash recovery.
 
 ## Metrics, benchmarks, and reading route
 

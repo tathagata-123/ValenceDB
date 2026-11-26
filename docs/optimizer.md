@@ -105,7 +105,7 @@ Planner and executors call the **same** small Compute helpers in their existing 
 | GHJ | same S; `p=min(64,(M-S)/(P+256)) >=2`; `Dghj=128p`; `build(side)=(M-S-Dghj)/(Tside+96)`; fallback M=`M-Dghj`, at least one legal fallback block |
 | ExternalSort | `S=2P+3*Tinput+1024`; `D=min(4096,M/1024)`; `R=128D`; `C_sort=(M-S-R)/Tinput >=1`; `k=min(64,(M-S-R)/(P+Tinput+128))` |
 | HashAggregate | `Tmax=max(Tinput,Toutput,Tpartial)`; `S=2P+3*Tmax+1024`; grouped capacity=`(M-S)/192 >=1` |
-| Aggregate combine | `Ccombine=3*Tmax+1024`; global/ordered requires M>=Ccombine; hash internal Msort=`M-Ccombine-P`; unordered SortAggregate Msort=`M-Ccombine` |
+| Aggregate combine | `Ccombine=3*Tmax+1024`; global/ordered requires M>=Ccombine; hash internal Msort=`M-Ccombine-(P+128)`; unordered SortAggregate Msort=`M-Ccombine` |
 
 GHJ local pages add two packed input volumes: partition writes and partition reads. Original inputs are paid by child costs exactly once. Skew is unknown; EXPLAIN names the runtime BNLJ overflow fallback. For 1,000 rows on both narrow sides at M=32768, GHJ wins at score 24.6, with p=5, Dghj=640, and build capacities 103/103. A separate forced GHJ test actually triggers one fallback pair without relabeling the plan.
 
@@ -154,7 +154,7 @@ Projection [2,0,1] rows=5 subtree_cost=6.0497 order=column 1
     M=24576 Tinput=216 S=9864 D=24 R=3072 C_sort=53 k=2
     predicted private run, no temp pages
     HashAggregate group=0 groups=5 predicted spill=no [uncertain]
-      M=32768 S=10296 group_capacity=117 internal_sort_budget=26568
+      M=32768 S=10296 group_capacity=117 internal_sort_budget=26440
       input_rows=64 local_cost=0.0128 subtree_cost=6.0485 output unordered
       GHJ keys=0,0 rows=64 local_cost=4.0252 subtree_cost=6.0357
         M=65536 S=10008 p=12 Dghj=1536 build=204,204 fallback_M=64000

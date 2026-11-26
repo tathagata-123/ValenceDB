@@ -23,7 +23,6 @@ struct GraceHashJoinMetrics {
     size_t peak_partition_writers = 0;
     size_t left_fallback_pairs = 0, right_fallback_pairs = 0;
     size_t completed_fallback_inner_scans = 0; // Actual BNLJ scans, counted at pair EOF.
-    size_t failed_build_rows = 0; // Extra prefix work on the defensive runtime-cap path.
 };
 
 class GraceHashJoin final : public Executor {
@@ -31,15 +30,15 @@ public:
     GraceHashJoin(QueryContext& context, GraceHashJoinPlan plan,
                   std::unique_ptr<Executor> left, std::unique_ptr<Executor> right);
     ~GraceHashJoin() noexcept override { Close(); }
-    void Init() override;
-    bool Next(Tuple& out) override;
-    void Close() noexcept override;
     const Schema& OutputSchema() const override { return schema_; }
     Ordering OutputOrdering() const override { return {}; }
     const GraceHashJoinMemory& Memory() const noexcept { return memory_; }
     const GraceHashJoinMetrics& Metrics() const noexcept { return metrics_; }
     static uint64_t PartitionHash(int64_t key) noexcept;
 private:
+    void DoInit() override;
+    bool DoNext(Tuple& out) override;
+    void DoClose() noexcept override;
     friend struct GraceHashJoinTestAccess; // Exercises the otherwise unreachable runtime cap.
     enum class Phase { Closed, SelectPair, Probe, Fallback, Done };
     struct BuildHash { size_t operator()(int64_t key) const noexcept; };

@@ -1,6 +1,5 @@
 #include "valencedb/execution/nested_loop_join.hpp"
 #include "join_helpers.hpp"
-#include <new>
 
 namespace valencedb {
 
@@ -15,53 +14,40 @@ NestedLoopJoin::NestedLoopJoin(QueryContext& context, JoinPlan plan,
     }
 }
 
-void NestedLoopJoin::Init() {
-    Start();
-    try {
-        metrics_ = {};
-        outer_->Init(); // Inner starts only after the first outer row is available.
-    } catch (const std::bad_alloc&) {
-        Close();
-        throw DbError("nested loop join memory allocation failed");
-    } catch (...) { Close(); throw; }
+void NestedLoopJoin::DoInit() {
+    metrics_ = {};
+    outer_->Init(); // Inner starts only after the first outer row is available.
 }
 
-bool NestedLoopJoin::Next(Tuple& out) {
-    if (!Ready()) return false;
-    try {
-        Tuple inner_row({});
-        for (;;) {
-            if (!have_outer_) {
-                if (!outer_->Next(outer_row_)) return End();
-                have_outer_ = true;
-                ++metrics_.outer_rows;
-                inner_->Init();
-                ++metrics_.inner_scans;
-            }
-            while (inner_->Next(inner_row)) {
-                ++metrics_.candidate_comparisons;
-                if (outer_row_.value(outer_key_).as_int64() != inner_row.value(inner_key_).as_int64())
-                    continue;
-                out = detail::JoinedTuple(outer_row_, inner_row, plan_.outer);
-                ++metrics_.output_rows;
-                return true; // Keep this outer row and the inner's next position.
-            }
-            inner_->Close();
-            outer_row_ = Tuple({});
-            have_outer_ = false;
+bool NestedLoopJoin::DoNext(Tuple& out) {
+    Tuple inner_row({});
+    for (;;) {
+        if (!have_outer_) {
+            if (!outer_->Next(outer_row_)) return false;
+            have_outer_ = true;
+            ++metrics_.outer_rows;
+            inner_->Init();
+            ++metrics_.inner_scans;
         }
-    } catch (const std::bad_alloc&) {
-        Close();
-        throw DbError("nested loop join memory allocation failed");
-    } catch (...) { Close(); throw; }
+        while (inner_->Next(inner_row)) {
+            ++metrics_.candidate_comparisons;
+            if (outer_row_.value(outer_key_).as_int64() != inner_row.value(inner_key_).as_int64())
+                continue;
+            out = detail::JoinedTuple(outer_row_, inner_row, plan_.outer);
+            ++metrics_.output_rows;
+            return true; // Keep this outer row and the inner's next position.
+        }
+        inner_->Close();
+        outer_row_ = Tuple({});
+        have_outer_ = false;
+    }
 }
 
-void NestedLoopJoin::Close() noexcept {
+void NestedLoopJoin::DoClose() noexcept {
     inner_->Close();
     outer_->Close();
     outer_row_ = Tuple({});
     have_outer_ = false;
-    CloseState();
 }
 
 }  // namespace valencedb

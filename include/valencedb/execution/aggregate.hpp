@@ -38,14 +38,14 @@ public:
     HashAggregate(QueryContext&, AggregateSpec, std::unique_ptr<Executor> child,
                   std::optional<size_t> memory_bytes = std::nullopt);
     ~HashAggregate() noexcept override { Close(); }
-    void Init() override;
-    bool Next(Tuple& out) override;
-    void Close() noexcept override;
     const Schema& OutputSchema() const override { return schema_; }
     Ordering OutputOrdering() const override { return {}; }
     const AggregateMemory& Memory() const noexcept { return memory_; }
     const AggregateMetrics& Metrics() const noexcept { return metrics_; }
 private:
+    void DoInit() override;
+    bool DoNext(Tuple& out) override;
+    void DoClose() noexcept override;
     friend struct AggregateTestAccess;
     enum class Phase { Closed, EmitGlobal, EmitHash, CombinePartials, Done };
     using Table = std::unordered_map<int64_t, AggregateState>;
@@ -69,14 +69,14 @@ public:
     SortAggregate(QueryContext&, AggregateSpec, std::unique_ptr<Executor> child,
                   std::optional<size_t> memory_bytes = std::nullopt);
     ~SortAggregate() noexcept override { Close(); }
-    void Init() override;
-    bool Next(Tuple& out) override;
-    void Close() noexcept override;
     const Schema& OutputSchema() const override { return schema_; }
     Ordering OutputOrdering() const override { return {spec_.group_column.has_value(), 0}; }
     const AggregateMemory& Memory() const noexcept { return memory_; }
     const AggregateMetrics& Metrics() const noexcept { return metrics_; }
 private:
+    void DoInit() override;
+    bool DoNext(Tuple& out) override;
+    void DoClose() noexcept override;
     friend struct AggregateTestAccess;
     AggregateSpec spec_;
     std::unique_ptr<Executor> input_; // Wrapped once at construction if sorting is needed.

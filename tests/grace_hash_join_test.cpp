@@ -144,27 +144,24 @@ public:
     Source(QueryContext& q, Schema schema, const std::vector<Tuple>& rows, SourceState& state)
         : Executor(q), schema_(std::move(schema)), rows_(rows), state_(state) {}
     ~Source() noexcept override { Close(); }
-    void Init() override {
-        Start();
+    void DoInit() override {
         state_.open = true;
         ++state_.inits;
         pos_ = 0;
         if (state_.inits > state_.allowed || state_.fail_init) throw DbError("child replay or Init failure");
     }
-    bool Next(Tuple& out) override {
-        if (!Ready()) return false;
+    bool DoNext(Tuple& out) override {
         Pins(context_.Db());
         ++state_.calls;
         if (pos_ == state_.fail_at) throw DbError("child Next failure");
-        if (pos_ == rows_.size()) return End();
+        if (pos_ == rows_.size()) return false;
         out = rows_[pos_++];
         ++state_.delivered;
         return true;
     }
-    void Close() noexcept override {
+    void DoClose() noexcept override {
         if (state_.open) ++state_.closes;
         state_.open = false;
-        CloseState();
     }
     const Schema& OutputSchema() const override { return schema_; }
     Ordering OutputOrdering() const override { return {true, 0}; }
@@ -210,7 +207,6 @@ void AuditPartitions(GraceHashJoin& join, const std::vector<Tuple>& left, const 
             const auto& part = parts[i];
             if (schema) VDB_CHECK(schema == &part.OutputSchema()); // One immutable schema, borrowed.
             schema = &part.OutputSchema();
-            VDB_CHECK(part.ModeledRowBytes() == part.RowCount() * RowMemoryCharge(*schema));
             if (!part.RowCount()) VDB_CHECK(part.PageCount() == 0 && part.FirstPage() == kInvalidPageId);
             TempReader reader(parts[i]);
             Tuple row({});
@@ -233,7 +229,7 @@ void AuditPartitions(GraceHashJoin& join, const std::vector<Tuple>& left, const 
     VDB_CHECK(join.Metrics().output_rows == 0 && join.Metrics().hash_pairs == 0);
 }
 // Predict decisions and page transfers from sealed descriptors, independently of diagnostics.
-size_t PairMetrics(const GraceHashJoin& join) {
+size_t PairMetrics(const GraceHashJoin& join, bool forced_fallback = false) {
     const auto& metrics = join.Metrics();
     const auto& memory = join.Memory();
     VDB_CHECK(metrics.hash_pairs + metrics.fallback_pairs + metrics.empty_pairs == memory.partition_count);
@@ -253,7 +249,7 @@ size_t PairMetrics(const GraceHashJoin& join) {
                                 r.RowCount() * (memory.right_row_bytes + 96);
         const size_t rows = build_left ? l.RowCount() : r.RowCount();
         const size_t capacity = build_left ? memory.left_build_capacity : memory.right_build_capacity;
-        if (rows <= capacity && !(i == 0 && metrics.failed_build_rows)) {
+        if (rows <= capacity && !(i == 0 && forced_fallback)) {
             ++hashes;
             if (build_left) ++left_builds; else ++right_builds;
             reads += l.PageCount() + r.PageCount();
@@ -367,7 +363,6 @@ void BoundariesAndSkew() {
         const auto m = Run(Narrow(), Narrow(), Rows(n, 7), Rows(n + 1, 7), 0, 0);
         VDB_CHECK(m.hash_pairs == (n <= 36 ? 1 : 0));
         VDB_CHECK(m.fallback_pairs == (n > 36 ? 1 : 0));
-        VDB_CHECK(m.failed_build_rows == 0);
         VDB_CHECK(m.peak_build_rows == (n <= 36 ? n : 0));
         std::cout << "boundary rows=" << n << " hash=" << m.hash_pairs << " fallback=" << m.fallback_pairs
                   << " outputs=" << m.output_rows << '\n';
@@ -405,10 +400,10 @@ void RuntimeCap() {
     join.Init();
     GraceHashJoinTestAccess::ForceRuntimeCap(join, 3);
     GraceHashJoinTestAccess::FallbackBudget(join);
-    VDB_CHECK(join.Metrics().failed_build_rows == 4 && join.Metrics().peak_build_rows == 3);
+    VDB_CHECK(join.Metrics().peak_build_rows == 3);
     VDB_CHECK(Canonical(join.OutputSchema(), Drain(db, join)) == Reference(join.OutputSchema(), left, right, 0, 0));
     VDB_CHECK(join.Metrics().hash_pairs == 0 && join.Metrics().fallback_pairs == 1 && join.Metrics().output_rows == 72);
-    PairMetrics(join);
+    PairMetrics(join, true);
     SingleConsumption(a, 8); SingleConsumption(b, 9);
     q.FinishQuery(join); GraceHashJoinTestAccess::Released(join); Clean(db);
 }
@@ -584,7 +579,7 @@ void TempLimits() {
     Throws([&] { sort.Init(); }, "cap");
     VDB_CHECK(observed->Metrics().hash_pairs == 2 && observed->Metrics().output_rows > 4);
     VDB_CHECK(observed->Metrics().peak_build_rows == 12 && observed->Metrics().fallback_pairs == 0);
-    VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 5 && q.Temps().Metrics().peak_temp_extent_pages == 5);
+    VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 5);
     VDB_CHECK(!sort.Exhausted() && !q.Succeeded());
     GraceHashJoinTestAccess::Released(*observed);
     sort.Close(); q.Close(); Clean(db);

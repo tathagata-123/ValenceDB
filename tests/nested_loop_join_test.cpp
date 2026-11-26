@@ -110,8 +110,7 @@ public:
     Source(QueryContext& q, Schema schema, const std::vector<Tuple>& rows, SourceState& state)
         : Executor(q), schema_(std::move(schema)), rows_(rows), state_(state) {}
     ~Source() noexcept override { Close(); }
-    void Init() override {
-        Start();
+    void DoInit() override {
         state_.open = true;
         ++state_.inits;
         position_ = 0;
@@ -119,20 +118,18 @@ public:
             Close(); throw DbError("injected child Init failure");
         }
     }
-    bool Next(Tuple& out) override {
-        if (!Ready()) return false;
+    bool DoNext(Tuple& out) override {
         Pins(context_.Db());
         ++state_.next_calls;
         if (position_ == state_.fail_at) throw DbError("injected child Next failure");
-        if (position_ == rows_.size()) return End();
+        if (position_ == rows_.size()) return false;
         out = rows_[position_++];
         ++state_.delivered;
         return true;
     }
-    void Close() noexcept override {
+    void DoClose() noexcept override {
         if (state_.open) ++state_.closes;
         state_.open = false;
-        CloseState();
     }
     const Schema& OutputSchema() const override { return schema_; }
     Ordering OutputOrdering() const override { return {true, 0}; }

@@ -131,13 +131,13 @@ S = 2*P + 3*Tmax + 1024
 G = 192
 Ccombine = 3*Tmax + 1024
 hash_group_capacity = floor((M-S)/G)    require M>S and capacity>=1
-hash internal Msort = M-Ccombine-P
+hash internal Msort = M-Ccombine-(P+128)
 sort aggregate Msort = M-Ccombine      unordered grouped input
 ```
 
 Checked helpers precede addition/multiplication/subtraction. Global and ordered streaming require M>=Ccombine, without reserving unnecessary staging pages. Grouped HashAggregate uses S for current/trigger/output tuples, spill staging, and fixed state. Modeled peak hash bytes charge S plus the full reserved group capacity times G, not just live entries.
 
-The hash-created TempScan's reader owns one private staging page outside the sorter's own model, explaining the extra P subtraction. That reader is destroyed when the sorter closes its input after run generation; the conservative reduced allowance remains unchanged through merging. Ordinary SortAggregate creates no extra external reader of its own. Its existing child has its own ownership; any future aggregate-owned reader would require another P reserve.
+The hash-created TempScan's reader owns one private staging page outside the sorter's own model, explaining the extra P+128 subtraction (staging page plus handle allowance). That reader is destroyed when the sorter closes its input after run generation; the conservative reduced allowance remains unchanged through merging. Ordinary SortAggregate creates no extra external reader of its own. Its existing child has its own ownership; any future aggregate-owned reader would require another page and handle reserve.
 
 ExternalSort independently applies its existing descriptor, run-capacity, and required fan-in checks. Positive Msort alone does not guarantee feasibility. Hash sorting feasibility is checked only when spilling is needed, so a tiny valid one-group/no-spill query remains legal. At M=10488 with narrow input, capacity=1 succeeds for one key; a second key spills and explicitly fails for insufficient internal sort memory. Raw input is never replayed or switched to raw SortAggregate on error. The sorter's finite descriptor limit also bounds successful partial-record volume; no recursive aggregation or run-descriptor redesign is added.
 
@@ -147,7 +147,7 @@ Representative measured configuration for two INT64 input columns and all output
 |---|---:|
 | M / Tmax / S / Ccombine | 32768 / 360 / 10296 / 2104 |
 | Group capacity / peak live groups | 117 / 117 |
-| Modeled peak hash bytes / internal Msort | 32760 / 26568 |
+| Modeled peak hash bytes / internal Msort | 32760 / 26440 |
 | Overflow flushes / all spill batches | 3 / 4 |
 | Partial records / output groups | 355 / 350 |
 | Partial sort initial runs / materialized passes | 10 / 3 |

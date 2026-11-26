@@ -34,14 +34,14 @@ class ExternalSort final : public Executor {
 public:
     ExternalSort(QueryContext& context, ExternalSortPlan plan, std::unique_ptr<Executor> child);
     ~ExternalSort() noexcept override { Close(); }
-    void Init() override;
-    bool Next(Tuple& out) override;
-    void Close() noexcept override;
     const Schema& OutputSchema() const override { return schema_; }
     Ordering OutputOrdering() const override { return {true, plan_.column}; }
     const ExternalSortMemory& Memory() const noexcept { return memory_; }
     const ExternalSortMetrics& Metrics() const noexcept { return metrics_; }
 private:
+    void DoInit() override;
+    bool DoNext(Tuple& out) override;
+    void DoClose() noexcept override;
     enum class OutputMode { PrivateRun, Merge };
     using Runs = std::vector<TempRun>;
     struct MergeInput {

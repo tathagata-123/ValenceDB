@@ -10,12 +10,12 @@ class TempScan final : public Executor {
 public:
     TempScan(QueryContext& context, const TempRun& run);
     ~TempScan() noexcept override { Close(); }
-    void Init() override;
-    bool Next(Tuple& out) override;
-    void Close() noexcept override;
     const Schema& OutputSchema() const override { return run_.OutputSchema(); }
     Ordering OutputOrdering() const override { return {}; }
 private:
+    void DoInit() override;
+    bool DoNext(Tuple& out) override;
+    void DoClose() noexcept override;
     TempRun run_;
     std::unique_ptr<TempReader> reader_;
 };
