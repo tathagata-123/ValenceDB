@@ -1,4 +1,4 @@
-// Standalone Phase 3 comparison probe; build commands are in docs/phase3_refactor.md.
+// Standalone insertion-only V1 probe; build commands are in docs/benchmarks.md.
 // TSV output is separate from the schema-v2 query benchmark stream.
 #include "bplus_validator.hpp"
 
@@ -19,7 +19,7 @@ int main(int argc, char** argv) {
         const auto leaf_max = static_cast<uint16_t>(std::stoul(argv[3]));
         const BPlusCapacity capacity{leaf_max, uint16_t(leaf_max == 254 ? 204 : leaf_max)};
         const auto dir = std::filesystem::temp_directory_path() /
-            ("valencedb_phase3_probe_" + std::to_string(Clock::now().time_since_epoch().count()));
+            ("valencedb_v1_probe_" + std::to_string(Clock::now().time_since_epoch().count()));
         std::filesystem::create_directory(dir);
         {
             DiskManager disk(dir / "db", OpenMode::CreateNew, dir / "tmp", OpenMode::CreateNew);
@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < rows; ++i) oracle.insert(key(i));
             const std::vector<BPlusKey> expected(oracle.begin(), oracle.end());
             std::cout << "operation\tms\tfetches\treads\twrites\tallocations\tevictions\tpeak_pins\n";
-            for (int operation = 0; operation < 4; ++operation) {
+            for (int operation = 0; operation < 3; ++operation) {
                 const auto before = pool.metrics();
                 const auto io = disk.counters();
                 const auto begin = Clock::now();
@@ -48,13 +48,11 @@ int main(int argc, char** argv) {
                     size_t i = 0;
                     while (auto e = cursor.Next()) { VDB_CHECK(i < rows && *e == expected[i]); ++i; }
                     VDB_CHECK(i == rows);
-                } else {
-                    for (auto i : order) { auto e = key(i); VDB_CHECK(tree.Erase(e.key, e.rid)); }
                 }
                 pool.FlushAll(); // Include final dirty writes in each operation's counters/timing.
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
                 VDB_CHECK(pool.metrics().active_pins == 0 && pool.metrics().peak_pins == 1);
-                const char* names[] = {"insert", "contains", "range", "erase"};
+                const char* names[] = {"insert", "contains", "range"};
                 std::cout << names[operation] << '\t' << ms << '\t'
                           << pool.metrics().buffer_fetches - before.buffer_fetches << '\t'
                           << disk.counters().database_reads - io.database_reads << '\t'
@@ -64,7 +62,7 @@ int main(int argc, char** argv) {
                           << pool.metrics().peak_pins << '\n';
                 // Independent raw-page validation is outside the timed operation.
                 const auto shape = bplus_test::Validator(pool, disk.PageCount(FileKind::Database), tree).Run();
-                VDB_CHECK(shape.entries == (operation == 3 ? std::vector<BPlusKey>{} : expected));
+                VDB_CHECK(shape.entries == expected);
             }
             pool.FlushAll();
             disk.Close();

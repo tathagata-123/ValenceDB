@@ -24,7 +24,8 @@ struct BPlusCapacity {
     uint16_t InternalMin() const { return (internal_max + 1) / 2; }
 };
 
-// Helpers interpret guarded bytes; callers own the guard and mark writes dirty.
+// Helpers check identity/count/bounds, not full ordering or tree structure.
+// Callers own the guard, preserve key order, and mark writes dirty.
 class BPlusLeafPage {
 public:
     static void Initialize(PageBytes& page, PageId id);

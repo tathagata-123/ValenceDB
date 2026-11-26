@@ -17,7 +17,6 @@ public:
     BPlusTree& operator=(const BPlusTree&) = delete;
 
     bool Insert(int64_t key, RID rid);
-    bool Erase(int64_t key, RID rid);
     bool Contains(int64_t key, RID rid) const;
     BPlusIterator LowerBound(int64_t key) const;
     BPlusIterator EqualRange(int64_t key) const;
@@ -35,7 +34,6 @@ private:
     struct Ancestor {
         PageId page;
         uint16_t child_index;
-        uint16_t child_count;
     };
     BPlusTree(BufferPool& pool, PageId meta_page, BPlusMeta meta, BPlusCapacity capacity)
         : pool_(pool), meta_page_(meta_page), meta_(meta), capacity_(capacity) {}
@@ -45,6 +43,7 @@ private:
     void WriteInternal(PageId id, std::span<const PageId> children,
                        std::span<const BPlusKey> separators);
     void SetRoot(PageId root, uint16_t height);
+    PageId AllocatePage();
     struct LeafNode {
         std::vector<BPlusKey> entries;
         PageId next;
@@ -52,13 +51,15 @@ private:
     struct InternalNode {
         std::vector<PageId> children;
         std::vector<BPlusKey> separators;
-        void RemoveRightChild(size_t left);
     };
     LeafNode ReadLeaf(PageId id) const;
     InternalNode ReadInternal(PageId id) const;
-    // Return the retired page on merge, INVALID on borrow. Parent stays in scratch.
-    PageId RepairLeaf(PageId id, LeafNode& current, InternalNode& parent, size_t index);
-    PageId RepairInternal(PageId id, InternalNode& current, InternalNode& parent, size_t index);
+    struct SplitResult {
+        BPlusKey separator;
+        PageId right;
+    };
+    SplitResult SplitLeaf(PageId id, const LeafNode& node);
+    SplitResult SplitInternal(PageId id, const InternalNode& node);
 
     BufferPool& pool_;
     PageId meta_page_;

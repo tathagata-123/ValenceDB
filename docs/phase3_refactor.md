@@ -1,5 +1,7 @@
 # Phase 3: B+ tree and buffer implementation
 
+> Historical report for the pre-V1 implementation. Deletion, repair, reservation, and their measurements below describe that preserved revision. Current behavior is documented in [B+ tree V1](bplus_tree.md) and the [V1 Phase 1 report](v1_phase1_refactor.md).
+
 ## Checkpoints and scope
 
 Phase 1 remains commit `092b80b`. All 17 uncommitted files matched the Phase 2

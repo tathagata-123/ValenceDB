@@ -95,14 +95,13 @@ std::optional<Tuple> Database::Fetch(const std::string& name, RID rid) {
 bool Database::Delete(const std::string& name, RID rid) {
     CheckMutable();
     auto table = catalog_->Find(name);
+    if (table.index_meta != kInvalidPageId)
+        throw DbError("deletion from indexed tables is not supported in V1");
     HeapFile heap(pool_, table);
-    // Fetch validates owner_meta_page before deriving a key or changing the index.
+    // Fetch validates the heap page owner before changing the heap.
     const auto old = heap.Fetch(rid);
     if (!old) return false;
     if (table.live_rows == 0) throw DbError("table row count underflow");
-    if (table.index_meta != kInvalidPageId &&
-        !TableIndex(table).Erase(old->value(table.index_col).as_int64(), rid))
-        throw DbError("live heap row missing from index");
     if (!heap.Erase(rid)) throw DbError("live heap row disappeared during delete");
     ++epoch_;
     catalog_->Save(table);

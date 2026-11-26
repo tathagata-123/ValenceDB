@@ -25,14 +25,6 @@ void WriteKey(PageBytes& page, size_t at, BPlusKey entry) {
     WriteRID(page, at + 8, entry.rid);
 }
 
-void CheckOrdered(std::span<const BPlusKey> entries) {
-    for (size_t i = 0; i < entries.size(); ++i) {
-        CheckKey(entries[i]);
-        if (i != 0 && !(entries[i - 1] < entries[i]))
-            throw DbError("B+ tree keys are not strictly increasing");
-    }
-}
-
 void CheckReserved(const PageBytes& page) {
     if (ReadU16(page, 18) != 0 || ReadU64(page, 24) != 0)
         throw DbError("nonzero B+ tree reserved header bytes");
@@ -90,7 +82,6 @@ void BPlusLeafPage::WriteEntry(PageBytes& page, size_t index, BPlusKey entry) {
 void BPlusLeafPage::Write(PageBytes& page, std::span<const BPlusKey> entries, uint16_t maximum) {
     if (maximum < 2 || maximum > kBPlusLeafMax || entries.size() > maximum)
         throw DbError("cannot persist overflowing B+ leaf");
-    CheckOrdered(entries);
     WriteU16(page, 16, static_cast<uint16_t>(entries.size()));
     for (size_t i = 0; i < entries.size(); ++i) WriteEntry(page, i, entries[i]);
 }
@@ -101,11 +92,6 @@ void BPlusLeafPage::Validate(const PageBytes& page, PageId id, uint16_t maximum)
     const auto count = Count(page);
     if (maximum < 2 || maximum > kBPlusLeafMax || count > maximum || Next(page) == id)
         throw DbError("invalid B+ leaf count or link");
-    for (size_t i = 0; i < count; ++i) {
-        const auto entry = Entry(page, i);
-        if (i != 0 && !(Entry(page, i - 1) < entry))
-            throw DbError("unordered B+ leaf entries");
-    }
 }
 
 void BPlusInternalPage::Initialize(PageBytes& page, PageId id) {
@@ -137,7 +123,6 @@ void BPlusInternalPage::Write(PageBytes& page, std::span<const PageId> children,
     if (maximum < 3 || maximum > kBPlusInternalMax || children.size() < 2 ||
         children.size() > maximum || separators.size() != children.size() - 1)
         throw DbError("cannot persist invalid or overflowing B+ internal node");
-    CheckOrdered(separators);
     for (PageId child : children)
         if (child == kInvalidPageId || child == ReadU32(page, 8)) throw DbError("invalid B+ child ID");
     WriteU16(page, 16, static_cast<uint16_t>(children.size()));
@@ -154,21 +139,12 @@ void BPlusInternalPage::Validate(const PageBytes& page, PageId id, uint16_t maxi
     const auto count = ChildCount(page);
     if (maximum < 3 || maximum > kBPlusInternalMax || count > maximum)
         throw DbError("B+ internal count exceeds configured capacity");
-    for (size_t i = 0; i < count; ++i) {
-        (void)Child(page, i);
-        if (i == 0) continue;
-        const auto separator = Separator(page, i - 1);
-        if (i > 1 && !(Separator(page, i - 2) < separator))
-            throw DbError("unordered B+ separators");
-    }
 }
 
 BPlusMeta BPlusMetaPage::Read(const PageBytes& page, PageId id) {
     ValidatePageHeader(page, PageType::IndexMeta, id);
     BPlusMeta meta{ReadU32(page, 16), ReadU16(page, 20), ReadU16(page, 22)};
     CheckMeta(id, meta);
-    for (size_t i = 24; i < page.size(); ++i)
-        if (page[i] != std::byte{0}) throw DbError("nonzero IndexMeta reserved bytes");
     return meta;
 }
 
@@ -180,5 +156,4 @@ void BPlusMetaPage::Write(PageBytes& page, PageId id, BPlusMeta meta) {
     WriteU16(page, 20, meta.height);
     WriteU16(page, 22, meta.key_column);
 }
-
 }  // namespace valencedb

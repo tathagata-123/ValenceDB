@@ -6,7 +6,7 @@ ValenceDB is a compact C++20 disk-oriented relational database engine built arou
 
 - **Page-oriented storage:** explicit serialization, 4096-byte pages, slotted heap pages, stable RIDs, a persistent catalog, and clean close/reopen persistence.
 - **Buffer management:** fixed-size BufferPool, PostgreSQL-inspired CLOCK sweep with bounded usage counts, scan-ring support, and RAII page guards.
-- **B+ tree index:** page-backed INT64 index with duplicate logical keys, split/merge/redistribution, root contraction, streaming cursors, and automatic table-index maintenance.
+- **B+ tree index:** insertion-only, page-backed INT64 index with duplicate logical keys, cascading splits, root growth, streaming cursors, and automatic index insertion. Deletion from indexed tables is rejected before heap access.
 - **Basic execution:** owned-tuple SeqScan, IndexScan, Filter, Projection, and append-only temporary relations.
 - **External sorting:** bounded run generation, multi-pass merge, finite descriptor accounting, and streamed final merge.
 - **Join algorithms:** tuple-at-a-time Nested Loop Join, Block Nested Loop Join, and one-level Grace Hash Join with bounded BNLJ fallback for oversized/skewed partitions.
@@ -28,7 +28,7 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
 
-The CTest suite covers storage primitives, buffer management, heap/catalog behavior, B+ tree insertion and deletion, execution, external sorting, nested-loop joins, Grace Hash Join, aggregation, optimizer behavior, and cross-component integration.
+The CTest suite covers storage primitives, buffer management, heap/catalog behavior, B+ tree insertion, index integration and indexed-delete rejection, execution, external sorting, nested-loop joins, Grace Hash Join, aggregation, optimizer behavior, and cross-component integration.
 
 ### Sanitizer build
 
@@ -128,7 +128,7 @@ At a high level:
 | System organization and ownership | [Architecture](docs/architecture.md) |
 | Page, tuple, heap, and catalog formats | [Storage](docs/storage.md) |
 | CLOCK sweep, scan ring, and guard rules | [Buffer manager](docs/buffer_manager.md) |
-| B+ tree search, split, delete, and repair | [B+ tree](docs/bplus_tree.md) |
+| B+ tree search, insertion, splits, and streaming scans | [B+ tree](docs/bplus_tree.md) |
 | Executor lifecycle and temporary storage | [Execution](docs/execution.md) |
 | Bounded external merge sort | [External sort](docs/external_sort.md) |
 | NLJ, BNLJ, and Grace Hash Join | [Joins](docs/joins.md) |
@@ -139,6 +139,8 @@ At a high level:
 
 ## Scope and non-goals
 
-ValenceDB is single-process, single-threaded, and supports one active query. Base-table types are NONNULL `INT64` and `VARCHAR`; intermediate/results additionally support `DOUBLE` and typed NULLs. Each table has at most one INT64 index. Automatic plans contain at most one binary join. Join, grouped aggregation, and ordering each use one NONNULL INT64 key; ordering is ascending. Global aggregation is supported.
+ValenceDB is single-process, single-threaded, and supports one active query. Base-table types are NONNULL `INT64` and `VARCHAR`; intermediate/results additionally support `DOUBLE` and typed NULLs. Each table has at most one INT64 index. V1 indexes support insertion and lookup; only non-indexed tables support deletion. Automatic plans contain at most one binary join. Join, grouped aggregation, and ordering each use one NONNULL INT64 key; ordering is ascending. Global aggregation is supported.
+
+V1 prioritizes textbook algorithms and student implementability. Unexpected allocation or I/O failures can require abandoning or rebuilding the affected instance; partially completed structural mutations are not rolled back. See the [V1 Phase 1 report](docs/v1_phase1_refactor.md).
 
 The project does **not** implement a SQL parser/frontend, transaction manager, MVCC, WAL/ARIES recovery, locking/deadlock detection, concurrency, parallel execution, networking, distribution, or replication. Persistent page allocation and query scratch allocation are append-only within their respective lifetimes. Statistics are sampled and approximate, and the planner is deliberately small rather than a Cascades-style optimizer.

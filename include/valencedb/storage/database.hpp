@@ -23,7 +23,7 @@ public:
     std::vector<std::string> TableNames() const;
     RID Insert(const std::string& name, const Tuple& tuple);
     std::optional<Tuple> Fetch(const std::string& name, RID rid);
-    bool Delete(const std::string& name, RID rid);
+    bool Delete(const std::string& name, RID rid); // V1: throws for indexed tables before heap access.
     HeapScan Scan(const std::string& name, ScanRing* ring = nullptr);
     void CreateIndex(const std::string& name, size_t column);
     // Database owns one stable handle per index; it must outlive returned cursors.

@@ -141,6 +141,16 @@ void PersistentPipeline() {
             Tuple row({Value(std::string(i % 2 ? "right" : "")), Value(i % 300 - 150)});
             right.push_back({db.Insert("r", row), row});
         }
+        // V1 permits heap deletion before the table is indexed.
+        for (size_t i = 0; i < left.size(); i += 17) {
+            VDB_CHECK(db.Delete("l", left[i].rid));
+            VDB_CHECK(!db.Delete("l", left[i].rid));
+            left[i].live = false;
+        }
+        for (size_t i = 0; i < right.size(); i += 29) {
+            VDB_CHECK(db.Delete("r", right[i].rid));
+            right[i].live = false;
+        }
         db.CreateIndex("l", 0);
         db.CreateIndex("r", 1);
         // Index maintenance also runs after bulk index construction, with signed endpoints.
@@ -149,15 +159,6 @@ void PersistentPipeline() {
             Tuple r({Value(std::string("extreme")), Value(key)});
             left.push_back({db.Insert("l", l), l});
             right.push_back({db.Insert("r", r), r});
-        }
-        for (size_t i = 0; i < left.size() - 2; i += 17) {
-            VDB_CHECK(db.Delete("l", left[i].rid));
-            VDB_CHECK(!db.Delete("l", left[i].rid));
-            left[i].live = false;
-        }
-        for (size_t i = 0; i < right.size() - 2; i += 29) {
-            VDB_CHECK(db.Delete("r", right[i].rid));
-            right[i].live = false;
         }
         CheckStored(db, "l", left, 0);
         CheckStored(db, "r", right, 1);

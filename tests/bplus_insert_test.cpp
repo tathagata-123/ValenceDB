@@ -125,7 +125,7 @@ void PageFormats() {
     Throws([&] { BPlusLeafPage::Entry(leaf, 254); });
     Throws([&] { BPlusLeafPage::WriteEntry(leaf, 254, entries[0]); });
     Throws([&] { BPlusLeafPage::SetNext(leaf, 7); });
-    for (size_t offset : {size_t(0), size_t(4), size_t(6), size_t(8), size_t(12), size_t(18), size_t(24), size_t(46)}) {
+    for (size_t offset : {size_t(0), size_t(4), size_t(6), size_t(8), size_t(12), size_t(18), size_t(24)}) {
         auto corrupt = full_leaf;
         corrupt[offset] ^= std::byte{1};
         Throws([&] { BPlusLeafPage::Validate(corrupt, 7); });
@@ -134,11 +134,11 @@ void PageFormats() {
     WriteU16(corrupt, 16, 255);
     Throws([&] { BPlusLeafPage::Validate(corrupt, 7); });
     corrupt = full_leaf;
-    BPlusLeafPage::WriteEntry(corrupt, 1, entries[0]);
-    Throws([&] { BPlusLeafPage::Validate(corrupt, 7); });
-    corrupt = full_leaf;
     WriteU32(corrupt, 40, kInvalidPageId);
-    Throws([&] { BPlusLeafPage::Validate(corrupt, 7); });
+    Throws([&] { BPlusLeafPage::Entry(corrupt, 0); });
+    corrupt = full_leaf;
+    corrupt[46] = std::byte{1};
+    Throws([&] { BPlusLeafPage::Entry(corrupt, 0); });
 
     PageBytes internal{};
     BPlusInternalPage::Initialize(internal, 300);
@@ -166,11 +166,9 @@ void PageFormats() {
     }
     corrupt = full_internal;
     WriteU32(corrupt, 20, kInvalidPageId);
-    Throws([&] { BPlusInternalPage::Validate(corrupt, 300); });
-    corrupt = full_internal;
-    WriteI64(corrupt, 52, 1);
-    WriteRID(corrupt, 60, {1, 0});
-    Throws([&] { BPlusInternalPage::Validate(corrupt, 300); });
+    Throws([&] { BPlusInternalPage::Child(corrupt, 0); });
+    Throws([&] { BPlusInternalPage::Child(full_internal, 204); });
+    Throws([&] { BPlusInternalPage::Separator(full_internal, 203); });
     children.resize(4);
     fences.resize(2);
     Throws([&] { BPlusInternalPage::Write(internal, children, fences); });
@@ -181,8 +179,6 @@ void PageFormats() {
     VDB_CHECK(BPlusMetaPage::Read(meta, 2).root == 7);
     for (BPlusMeta bad : {BPlusMeta{kInvalidPageId, 1, 0}, {2, 1, 0}, {7, 0, 0}, {7, 33, 0}, {7, 1, 8}})
         Throws([&] { BPlusMetaPage::Write(meta, 2, bad); });
-    meta[4095] = std::byte{1};
-    Throws([&] { BPlusMetaPage::Read(meta, 2); });
 }
 
 void EmptyAndSingleReopen() {
@@ -351,20 +347,20 @@ void OrderedInserts() {
         Database db(files.db, OpenMode::CreateNew, files.temp, 1);
         auto tree = BPlusTree::Create(db.Buffer(), UINT16_MAX, {4, 4});
         Oracle oracle;
-        size_t largest_reservation = 0;
+        size_t largest_allocation = 0;
         for (int64_t i = 0; i < 350; ++i) {
             const auto pages = db.Disk().PageCount(FileKind::Database);
             Insert(db, tree, oracle, {reverse ? 349 - i : i, {0, 0}});
-            largest_reservation = std::max(largest_reservation,
+            largest_allocation = std::max(largest_allocation,
                 size_t(db.Disk().PageCount(FileKind::Database) - pages));
             if (i < 25 || i % 37 == 0) CheckTree(db, tree, oracle);
         }
         CheckTree(db, tree, oracle);
-        VDB_CHECK(tree.Height() >= 5 && largest_reservation >= 5);
+        VDB_CHECK(tree.Height() >= 5 && largest_allocation >= 5);
         VDB_CHECK(db.Metrics().evictions > 0 && db.Metrics().dirty_evictions > 0);
         VDB_CHECK(db.Metrics().peak_pins == 1);
         std::cout << (reverse ? "descending" : "ascending") << ": height=" << tree.Height()
-                  << " largest reservation=" << largest_reservation << " peak pins=" << db.Metrics().peak_pins << '\n';
+                  << " largest split allocation=" << largest_allocation << " peak pins=" << db.Metrics().peak_pins << '\n';
         db.Close();
     }
 }
@@ -402,19 +398,20 @@ void DuplicatesExtremesRanges() {
 }
 
 void RandomizedAndReopen() {
-    for (uint32_t seed : {uint32_t(20260930), uint32_t(0xBADC0DE), uint32_t(71827)}) {
+    for (uint32_t seed : {uint32_t(20260930), uint32_t(0xBADC0DE), uint32_t(71827), uint32_t(203)}) {
         std::cout << "random seed=" << seed << std::endl;
         Files files("random");
         Oracle oracle;
         PageId meta, root;
         uint16_t height;
-        const BPlusCapacity cap = seed == 71827 ? BPlusCapacity{5, 5} : BPlusCapacity{4, 4};
+        const BPlusCapacity cap = seed == 71827 ? BPlusCapacity{5, 5} :
+                                  seed == 203 ? BPlusCapacity{2, 3} : BPlusCapacity{4, 4};
         {
-            Database db(files.db, OpenMode::CreateNew, files.temp, 3);
+            Database db(files.db, OpenMode::CreateNew, files.temp, 1);
             auto tree = BPlusTree::Create(db.Buffer(), 0, cap);
             meta = tree.MetaPage();
             std::mt19937 rng(seed);
-            for (int step = 0; step < 900; ++step) {
+            for (int step = 0; step < 4000; ++step) {
                 BPlusKey key{int64_t(rng() % 51) - 25, {PageId(rng() % 7), uint16_t(rng() % 5)}};
                 if (step % 59 == 0) key.key = step % 118 == 0 ? kMin : kMax;
                 Insert(db, tree, oracle, key);
@@ -457,27 +454,28 @@ void RandomizedAndReopen() {
     }
 }
 
-void PreallocationFailure() {
-    Files files("preallocation_failure");
+void IoErrorsPropagate() {
+    Files files("io_error");
     Database db(files.db, OpenMode::CreateNew, files.temp, 1);
     auto tree = BPlusTree::Create(db.Buffer(), UINT16_MAX, {4, 4});
     Oracle oracle;
     for (int64_t i = 0; i < 4; ++i) Insert(db, tree, oracle, {i, {0, 0}});
     auto cursor = tree.LowerBound(kMin);
-    const auto original = Copy(db, tree.RootPage());  // Dirty full root remains the sole resident frame.
-    const auto pages = db.Disk().PageCount(FileKind::Database);
-    const auto epoch = tree.MutationEpoch();
+    db.Flush();
+    db.Buffer().Invalidate({FileKind::Database, tree.RootPage()});
+    db.Disk().FailNextIo(FailNext::Read);
+    Throws([&] { cursor.Next(); }); // A read error must not become normal EOF.
+    NoPins(db);
+
+    Insert(db, tree, oracle, {-1, {0, 0}});
+    // Leave a dirty leaf in the only frame, then fail its eviction on insertion.
+    Insert(db, tree, oracle, {4, {0, 0}});
     const auto failed = db.Disk().counters().failed_writes;
     db.Disk().FailNextIo(FailNext::Write);
-    Throws([&] { tree.Insert(4, {0, 0}); });  // Reservation cannot evict the dirty root.
+    Throws([&] { tree.Insert(5, {0, 0}); });
     VDB_CHECK(db.Disk().counters().failed_writes == failed + 1);
-    VDB_CHECK(db.Disk().PageCount(FileKind::Database) == pages + 1);  // Append-only orphan allowed.
-    VDB_CHECK(Copy(db, tree.RootPage()) == original && tree.MutationEpoch() == epoch);
-    VDB_CHECK(tree.Height() == 1);
-    VDB_CHECK(Drain(cursor, db) == Expected(oracle));
-    CheckTree(db, tree, oracle);
-    Insert(db, tree, oracle, {4, {0, 0}});
-    CheckTree(db, tree, oracle);
+    NoPins(db);
+    // Abandon this tree: no rollback, unchanged contents, or retry is promised.
     db.Close();
 }
 
@@ -548,14 +546,23 @@ void StableFencesAndCorruption() {
     WriteU32(bad, 16, first_leaf);
     expect_checker_failure(tree.MetaPage(), bad, good_meta);
 
+    bad = good_meta;
+    bad[4095] = std::byte{1}; // Full reserved-area auditing belongs to the test validator.
+    expect_checker_failure(tree.MetaPage(), bad, good_meta);
+    bad = good_leaf;
+    bad[46] = std::byte{1}; // RID padding.
+    expect_checker_failure(first_leaf, bad, good_leaf);
+    bad = good_leaf;
+    bad[24] = std::byte{1};
+    expect_checker_failure(first_leaf, bad, good_leaf);
+
     // Open rejects malformed metadata and the wrong root type, without leaking pins.
-    for (auto mutation : std::array<std::function<void(PageBytes&)>, 6>{
+    for (auto mutation : std::array<std::function<void(PageBytes&)>, 5>{
             [](PageBytes& p) { WriteU32(p, 16, kInvalidPageId); },
             [](PageBytes& p) { WriteU16(p, 20, 0); },
             [](PageBytes& p) { WriteU16(p, 20, 1); },
             [](PageBytes& p) { WriteU16(p, 22, 8); },
-            [](PageBytes& p) { WriteU16(p, 6, 2); },
-            [](PageBytes& p) { p[24] = std::byte{1}; }}) {
+            [](PageBytes& p) { WriteU16(p, 6, 2); }}) {
         bad = good_meta;
         mutation(bad);
         Replace(db, tree.MetaPage(), bad);
@@ -580,6 +587,16 @@ void StableFencesAndCorruption() {
     Throws([&] { BPlusTree::Open(db.Buffer(), tree.MetaPage(), {255, 4}); });
     VDB_CHECK(db.Disk().PageCount(FileKind::Database) == pages);
     CheckTree(db, tree, oracle);
+
+    // Full internal ordering is also the independent validator's responsibility.
+    for (int64_t key : {60, 70, 80}) Insert(db, tree, oracle, {key, {0, 0}});
+    const auto ordered_root = Copy(db, tree.RootPage());
+    VDB_CHECK(ReadU16(ordered_root, 16) >= 3);
+    bad = ordered_root;
+    WriteI64(bad, 52, ReadI64(bad, 32));
+    WriteRID(bad, 60, ReadRID(bad, 40)); // Second separator duplicates the first.
+    expect_checker_failure(tree.RootPage(), bad, ordered_root);
+    CheckTree(db, tree, oracle);
     db.Close();
 }
 
@@ -600,7 +617,7 @@ int main() {
         Run("increasing and decreasing insertion", OrderedInserts);
         Run("duplicates, extremes, ranges and cursor epochs", DuplicatesExtremesRanges);
         Run("randomized oracle and multilevel reopen", RandomizedAndReopen);
-        Run("reservation failure before mutation", PreallocationFailure);
+        Run("I/O errors propagate and release pins", IoErrorsPropagate);
         Run("stable lower fences and corruption detection", StableFencesAndCorruption);
         std::cout << "B+ tree insert passed: " << cases_passed << " cases; max height=" << maximum_height
                   << "; peak pins=" << maximum_pins << "; active pins=0\n";

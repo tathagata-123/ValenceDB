@@ -36,10 +36,8 @@ struct TreeShape {
 // Reads actual persistent pages through BufferPool, never production tree traversal.
 class Validator {
 public:
-    Validator(BufferPool& pool, uint32_t allocated, const BPlusTree& tree,
-              std::set<PageId> retired = {})
-        : pool_(pool), allocated_(allocated), tree_(tree), capacity_(tree.Capacity()),
-          retired_(std::move(retired)) {}
+    Validator(BufferPool& pool, uint32_t allocated, const BPlusTree& tree)
+        : pool_(pool), allocated_(allocated), tree_(tree), capacity_(tree.Capacity()) {}
 
     TreeShape Run() {
         VDB_CHECK(tree_.MetaPage() < allocated_);
@@ -62,7 +60,7 @@ public:
         std::vector<BPlusKey> entries;
         PageId id = shape_.leaves.front();
         while (id != kInvalidPageId) {
-            VDB_CHECK(id < allocated_ && !retired_.contains(id) && chain_seen.insert(id).second);
+            VDB_CHECK(id < allocated_ && chain_seen.insert(id).second);
             auto guard = pool_.Fetch({FileKind::Database, id});
             ValidatePageHeader(guard.Data(), PageType::BPlusLeaf, id);
             const auto count = ReadU16(guard.Data(), 16);
@@ -82,7 +80,7 @@ private:
     struct Bounds { std::optional<BPlusKey> minimum, maximum; };
 
     Bounds Walk(PageId id, uint16_t depth, bool root) {
-        VDB_CHECK(id < allocated_ && !retired_.contains(id) && seen_.insert(id).second);
+        VDB_CHECK(id < allocated_ && seen_.insert(id).second);
         VDB_CHECK(depth <= tree_.Height());
         ++shape_.nodes;
         auto guard = pool_.Fetch({FileKind::Database, id});
@@ -140,7 +138,6 @@ private:
     const BPlusTree& tree_;
     BPlusCapacity capacity_;
     std::set<PageId> seen_;
-    std::set<PageId> retired_;
     TreeShape shape_;
 };
 }  // namespace bplus_test

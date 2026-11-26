@@ -195,3 +195,25 @@ To compare version 2 and 3 plan records, fold a SortAggregate's old synthetic
 sort into its local cost and replace that child with the sort's input. Compare
 subtree costs, actual algorithms, and execution counters independently; do not
 interpret the removed display node as removal of the sorting work.
+
+
+## Standalone V1 B+ tree probe
+
+`bench/bplus_tree_probe.cpp` measures insertion, exact lookup, and a full inclusive
+range with duplicate logical keys, then independently validates raw-page structure
+outside each timed operation. V1 removes the former erase phase. Old Phase 3 erase
+measurements remain historical and are not a current supported workload.
+
+```sh
+c++ -std=c++20 -O3 -DNDEBUG -Wall -Wextra -Wpedantic -Iinclude -Itests \
+  bench/bplus_tree_probe.cpp build-release/libvalencedb.a -o build-release/valencedb_bplus_probe
+build-release/valencedb_bplus_probe 1 8000 254
+build-release/valencedb_bplus_probe 16 8000 254
+build-release/valencedb_bplus_probe 1 350 4
+```
+
+Arguments are buffer frames, rows, and leaf capacity; internal capacity is 204 for
+leaf capacity 254 and otherwise matches the supplied leaf capacity. The probe
+prints elapsed time, fetches, reads, writes, allocations, evictions, and peak pins.
+The query benchmark harness continues to exercise insertion, IndexScan point/range
+access, and cross-component output equivalence without deletion.

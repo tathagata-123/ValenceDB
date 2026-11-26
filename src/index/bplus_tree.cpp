@@ -3,7 +3,6 @@
 
 #include <array>
 #include <algorithm>
-#include <cassert>
 
 namespace valencedb {
 namespace {
@@ -71,7 +70,7 @@ PageId BPlusTree::Descend(BPlusKey key, std::vector<Ancestor>* path) const {
             if (key < BPlusInternalPage::Separator(guard.Data(), middle)) high = middle;
             else low = middle + 1;
         }
-        if (path) path->push_back({page, low, count});
+        if (path) path->push_back({page, low});
         page = BPlusInternalPage::Child(guard.Data(), low);
         // guard dies here; the ancestor path contains only numbers.
     }
@@ -93,15 +92,7 @@ BPlusIterator BPlusTree::Start(int64_t key, std::optional<int64_t> upper) const 
     PageId leaf = Descend(entry);
     auto guard = pool_.Fetch({FileKind::Database, leaf});
     BPlusLeafPage::Validate(guard.Data(), leaf, capacity_.leaf_max);
-    uint16_t at = LeafLowerBound(guard.Data(), entry);
-    while (at == BPlusLeafPage::Count(guard.Data())) {
-        leaf = BPlusLeafPage::Next(guard.Data());
-        guard.Drop();
-        at = 0;
-        if (leaf == kInvalidPageId) break;
-        guard = pool_.Fetch({FileKind::Database, leaf});
-        BPlusLeafPage::Validate(guard.Data(), leaf, capacity_.leaf_max);
-    }
+    const uint16_t at = LeafLowerBound(guard.Data(), entry);
     return BPlusIterator(*this, leaf, at, upper);
 }
 
@@ -130,104 +121,76 @@ void BPlusTree::WriteInternal(PageId id, std::span<const PageId> children,
 
 void BPlusTree::SetRoot(PageId root, uint16_t height) {
     auto guard = pool_.Fetch({FileKind::Database, meta_page_});
-    (void)BPlusMetaPage::Read(guard.Data(), meta_page_);
+    ValidatePageHeader(guard.Data(), PageType::IndexMeta, meta_page_);
     const BPlusMeta updated{root, height, meta_.key_column};
     BPlusMetaPage::Write(guard.MutableData(), meta_page_, updated);
     guard.MarkDirty();
     meta_ = updated;
 }
 
+PageId BPlusTree::AllocatePage() {
+    auto guard = pool_.NewPage(FileKind::Database);
+    return guard.Page().page_id; // Release the allocation pin before any other fetch.
+}
+
+BPlusTree::SplitResult BPlusTree::SplitLeaf(PageId id, const LeafNode& node) {
+    // Copy the first right key UP; it also remains in the right leaf.
+    const size_t middle = node.entries.size() / 2;
+    const PageId right = AllocatePage();
+    const std::span<const BPlusKey> entries(node.entries);
+    WriteLeaf(right, entries.subspan(middle), node.next);
+    WriteLeaf(id, entries.first(middle), right);
+    return {entries[middle], right};
+}
+
+BPlusTree::SplitResult BPlusTree::SplitInternal(PageId id, const InternalNode& node) {
+    // Move the boundary separator UP; omit it from both internal pages.
+    const size_t middle = node.children.size() / 2;
+    const PageId right = AllocatePage();
+    const std::span<const PageId> children(node.children);
+    const std::span<const BPlusKey> separators(node.separators);
+    WriteInternal(right, children.subspan(middle), separators.subspan(middle));
+    WriteInternal(id, children.first(middle), separators.first(middle - 1));
+    return {separators[middle - 1], right};
+}
+
 bool BPlusTree::Insert(int64_t key, RID rid) {
     CheckRID(rid);
     const BPlusKey entry{key, rid};
-    std::vector<Ancestor> ancestor_path;
-    const PageId leaf = Descend(entry, &ancestor_path);
-    auto guard = pool_.Fetch({FileKind::Database, leaf});
-    BPlusLeafPage::Validate(guard.Data(), leaf, capacity_.leaf_max);
-    const uint16_t count = BPlusLeafPage::Count(guard.Data());
-    const uint16_t at = LeafLowerBound(guard.Data(), entry);
-    if (at < count && BPlusLeafPage::Entry(guard.Data(), at) == entry) return false;
-
-    // Only this leaf's bounded overflow representation lives in memory.
-    std::vector<BPlusKey> entries;
-    entries.reserve(count + 1);
-    for (uint16_t i = 0; i < count; ++i) entries.push_back(BPlusLeafPage::Entry(guard.Data(), i));
-    entries.insert(entries.begin() + at, entry);
-    if (count < capacity_.leaf_max) {
-        BPlusLeafPage::Write(guard.MutableData(), entries, capacity_.leaf_max);
-        guard.MarkDirty();
-        guard.Drop();
+    std::vector<Ancestor> path;
+    const PageId leaf_id = Descend(entry, &path);
+    auto leaf = ReadLeaf(leaf_id);
+    const auto at = std::lower_bound(leaf.entries.begin(), leaf.entries.end(), entry);
+    if (at != leaf.entries.end() && *at == entry) return false;
+    leaf.entries.insert(at, entry);
+    if (leaf.entries.size() <= capacity_.leaf_max) {
+        WriteLeaf(leaf_id, leaf.entries, leaf.next);
         ++epoch_;
         return true;
     }
-    const PageId old_next = BPlusLeafPage::Next(guard.Data());
-    guard.Drop();
 
-    // Predict the whole cascade before changing any existing page.
-    size_t needed = 1;  // right leaf
-    bool grows_root = true;
-    for (size_t level = ancestor_path.size(); level > 0; --level) {
-        if (ancestor_path[level - 1].child_count < capacity_.internal_max) {
-            grows_root = false;
-            break;
-        }
-        ++needed;  // right internal node
-    }
-    if (grows_root) {
-        if (meta_.height == kBPlusMaxHeight) throw DbError("B+ tree height limit");
-        ++needed;
-    }
-    std::vector<PageId> reserved;
-    reserved.reserve(needed);
-    for (size_t i = 0; i < needed; ++i) {
-        auto allocation = pool_.NewPage(FileKind::Database);
-        reserved.push_back(allocation.Page().page_id);
-        // No reservation guard survives this iteration. Unused pages remain unreachable.
-    }
-
-    // Leaf split: original page is left; floor(total/2) gives 127 + 128 in production.
-    size_t used = 0;
-    PageId right_page = reserved[used++];
-    const size_t left_count = entries.size() / 2;
-    BPlusKey separator = entries[left_count];
-    const std::span<const BPlusKey> all_entries(entries);
-    WriteLeaf(right_page, all_entries.subspan(left_count), old_next);
-    WriteLeaf(leaf, all_entries.first(left_count), right_page);
-    PageId left_page = leaf;
-
-    // Insert separator/right child at the exact descent index, then propagate if full.
-    for (size_t level = ancestor_path.size(); level > 0; --level) {
-        const Ancestor ancestor = ancestor_path[level - 1];
-        const size_t child_index = ancestor.child_index;
+    auto split = SplitLeaf(leaf_id, leaf);
+    // Each saved child index identifies where the separator/right child belongs.
+    while (!path.empty()) {
+        const auto ancestor = path.back();
+        path.pop_back();
         auto parent = ReadInternal(ancestor.page);
-        assert(parent.children.size() == ancestor.child_count);
-        assert(parent.children[child_index] == left_page);
-        parent.children.insert(parent.children.begin() + child_index + 1, right_page);
-        parent.separators.insert(parent.separators.begin() + child_index, separator);
+        parent.children.insert(parent.children.begin() + ancestor.child_index + 1, split.right);
+        parent.separators.insert(parent.separators.begin() + ancestor.child_index, split.separator);
         if (parent.children.size() <= capacity_.internal_max) {
             WriteInternal(ancestor.page, parent.children, parent.separators);
-            assert(used == reserved.size());
             ++epoch_;
             return true;
         }
-
-        // Internal split: promote the boundary and omit it from BOTH split pages.
-        const size_t left_children = parent.children.size() / 2;
-        separator = parent.separators[left_children - 1];
-        right_page = reserved[used++];
-        const std::span<const PageId> all_children(parent.children);
-        const std::span<const BPlusKey> all_separators(parent.separators);
-        WriteInternal(right_page, all_children.subspan(left_children), all_separators.subspan(left_children));
-        WriteInternal(ancestor.page, all_children.first(left_children), all_separators.first(left_children - 1));
-        left_page = ancestor.page;
+        split = SplitInternal(ancestor.page, parent);
     }
 
-    // Propagation reached above the old root. Publish the new root through IndexMeta.
-    assert(grows_root && left_page == meta_.root);
-    const PageId new_root = reserved[used++];
-    WriteInternal(new_root, std::array<PageId, 2>{left_page, right_page}, std::array<BPlusKey, 1>{separator});
-    SetRoot(new_root, static_cast<uint16_t>(meta_.height + 1));
-    assert(used == reserved.size());
+    // The old root is the left half of the final split.
+    if (meta_.height == kBPlusMaxHeight) throw DbError("B+ tree height limit");
+    const PageId root = AllocatePage();
+    WriteInternal(root, std::array<PageId, 2>{meta_.root, split.right},
+                  std::array<BPlusKey, 1>{split.separator});
+    SetRoot(root, static_cast<uint16_t>(meta_.height + 1));
     ++epoch_;
     return true;
 }
@@ -237,7 +200,7 @@ BPlusTree::LeafNode BPlusTree::ReadLeaf(PageId id) const {
     BPlusLeafPage::Validate(guard.Data(), id, capacity_.leaf_max);
     LeafNode node{{}, BPlusLeafPage::Next(guard.Data())};
     const auto count = BPlusLeafPage::Count(guard.Data());
-    node.entries.reserve(count);
+    node.entries.reserve(count + 1);
     for (size_t i = 0; i < count; ++i)
         node.entries.push_back(BPlusLeafPage::Entry(guard.Data(), i));
     return node;
@@ -248,7 +211,7 @@ BPlusTree::InternalNode BPlusTree::ReadInternal(PageId id) const {
     BPlusInternalPage::Validate(guard.Data(), id, capacity_.internal_max);
     InternalNode node;
     const auto count = BPlusInternalPage::ChildCount(guard.Data());
-    // Leave room for one insertion or borrowed child without growing the vectors.
+    // Leave room for one inserted child without growing the vectors.
     node.children.reserve(count + 1);
     node.separators.reserve(count);
     for (size_t i = 0; i < count; ++i) {
@@ -256,168 +219,6 @@ BPlusTree::InternalNode BPlusTree::ReadInternal(PageId id) const {
         if (i != 0) node.separators.push_back(BPlusInternalPage::Separator(guard.Data(), i - 1));
     }
     return node;
-}
-
-void BPlusTree::InternalNode::RemoveRightChild(size_t left) {
-    assert(left + 1 < children.size());
-    children.erase(children.begin() + left + 1);
-    separators.erase(separators.begin() + left);
-    assert(children.size() == separators.size() + 1);
-}
-
-PageId BPlusTree::RepairLeaf(PageId id, LeafNode& current, InternalNode& parent, size_t index) {
-    // Deterministic policy: lend left, lend right, merge left, merge right.
-    // Keep the left sibling for a possible merge after checking the right.
-    LeafNode left{};
-    if (index > 0) {
-        const PageId left_id = parent.children[index - 1];
-        left = ReadLeaf(left_id);
-        if (left.entries.size() > capacity_.LeafMin()) {
-            const BPlusKey moved = left.entries.back();
-            left.entries.pop_back();
-            current.entries.insert(current.entries.begin(), moved);
-            parent.separators[index - 1] = moved;
-            WriteLeaf(left_id, left.entries, left.next);
-            WriteLeaf(id, current.entries, current.next);
-            return kInvalidPageId;
-        }
-    }
-    if (index + 1 < parent.children.size()) {
-        const PageId right_id = parent.children[index + 1];
-        auto right = ReadLeaf(right_id);
-        if (right.entries.size() > capacity_.LeafMin()) {
-            current.entries.push_back(right.entries.front());
-            right.entries.erase(right.entries.begin());
-            parent.separators[index] = right.entries.front();
-            WriteLeaf(right_id, right.entries, right.next);
-            WriteLeaf(id, current.entries, current.next);
-            return kInvalidPageId;
-        }
-        // Neither sibling can lend, and there is no left sibling: merge right.
-        if (index == 0) {
-            assert(current.next == right_id);
-            current.entries.insert(current.entries.end(), right.entries.begin(), right.entries.end());
-            WriteLeaf(id, current.entries, right.next);
-            parent.RemoveRightChild(0);
-            return right_id;
-        }
-    }
-    // Always retain the left page and skip the retired right page in the leaf chain.
-    assert(index > 0);
-    const PageId left_id = parent.children[index - 1];
-    assert(left.next == id);
-    left.entries.insert(left.entries.end(), current.entries.begin(), current.entries.end());
-    WriteLeaf(left_id, left.entries, current.next);
-    parent.RemoveRightChild(index - 1);
-    return id;
-}
-
-PageId BPlusTree::RepairInternal(PageId id, InternalNode& current,
-                                InternalNode& parent, size_t index) {
-    // Keep the left sibling for a possible merge after checking the right.
-    InternalNode left{};
-    if (index > 0) {
-        const PageId left_id = parent.children[index - 1];
-        left = ReadInternal(left_id);
-        if (left.children.size() > capacity_.InternalMin()) {
-            // Rotate left's last fence UP and the old parent fence DOWN.
-            current.children.insert(current.children.begin(), left.children.back());
-            current.separators.insert(current.separators.begin(), parent.separators[index - 1]);
-            parent.separators[index - 1] = left.separators.back();
-            left.children.pop_back();
-            left.separators.pop_back();
-            WriteInternal(left_id, left.children, left.separators);
-            WriteInternal(id, current.children, current.separators);
-            return kInvalidPageId;
-        }
-    }
-    if (index + 1 < parent.children.size()) {
-        const PageId right_id = parent.children[index + 1];
-        auto right = ReadInternal(right_id);
-        if (right.children.size() > capacity_.InternalMin()) {
-            // Rotate the old parent fence DOWN and right's first fence UP.
-            current.children.push_back(right.children.front());
-            current.separators.push_back(parent.separators[index]);
-            parent.separators[index] = right.separators.front();
-            right.children.erase(right.children.begin());
-            right.separators.erase(right.separators.begin());
-            WriteInternal(right_id, right.children, right.separators);
-            WriteInternal(id, current.children, current.separators);
-            return kInvalidPageId;
-        }
-        // Neither sibling can lend, and there is no left sibling: merge right.
-        if (index == 0) {
-            current.children.insert(current.children.end(), right.children.begin(), right.children.end());
-            current.separators.push_back(parent.separators[0]);
-            current.separators.insert(current.separators.end(), right.separators.begin(), right.separators.end());
-            WriteInternal(id, current.children, current.separators);
-            parent.RemoveRightChild(0);
-            return right_id;
-        }
-    }
-    assert(index > 0);
-    const PageId left_id = parent.children[index - 1];
-    left.children.insert(left.children.end(), current.children.begin(), current.children.end());
-    left.separators.push_back(parent.separators[index - 1]);
-    left.separators.insert(left.separators.end(), current.separators.begin(), current.separators.end());
-    WriteInternal(left_id, left.children, left.separators);
-    parent.RemoveRightChild(index - 1);
-    return id;
-}
-
-bool BPlusTree::Erase(int64_t key, RID rid) {
-    CheckRID(rid);
-    const BPlusKey entry{key, rid};
-    std::vector<Ancestor> ancestor_path;
-    PageId current_id = Descend(entry, &ancestor_path);
-    auto leaf = ReadLeaf(current_id);
-    const auto at = std::lower_bound(leaf.entries.begin(), leaf.entries.end(), entry);
-    if (at == leaf.entries.end() || !(*at == entry)) return false;
-    leaf.entries.erase(at);
-    if (ancestor_path.empty() || leaf.entries.size() >= capacity_.LeafMin()) {
-        // Stable fences need no update when a right minimum disappears.
-        WriteLeaf(current_id, leaf.entries, leaf.next);
-        ++epoch_;
-        return true;
-    }
-
-    // Repair the leaf once. Only internal nodes can underflow above this point.
-    std::vector<PageId> retired;
-    Ancestor ancestor = ancestor_path.back();
-    ancestor_path.pop_back();
-    auto current = ReadInternal(ancestor.page);
-    assert(current.children[ancestor.child_index] == current_id);
-    const PageId removed_leaf = RepairLeaf(current_id, leaf, current, ancestor.child_index);
-    if (removed_leaf != kInvalidPageId) retired.push_back(removed_leaf);
-    current_id = ancestor.page;
-
-    while (true) {
-        if (current_id == meta_.root && current.children.size() == 1) {
-            // Never serialize a one-child internal root. The child is already valid.
-            SetRoot(current.children.front(), static_cast<uint16_t>(meta_.height - 1));
-            retired.push_back(current_id);
-            break;
-        }
-        if (current_id == meta_.root || current.children.size() >= capacity_.InternalMin()) {
-            WriteInternal(current_id, current.children, current.separators);
-            break;
-        }
-
-        // Carry the underfull internal node in owned scratch, not on disk or in a guard.
-        assert(!ancestor_path.empty());
-        ancestor = ancestor_path.back();
-        ancestor_path.pop_back();
-        auto parent = ReadInternal(ancestor.page);
-        assert(parent.children[ancestor.child_index] == current_id);
-        const PageId removed = RepairInternal(current_id, current, parent, ancestor.child_index);
-        if (removed != kInvalidPageId) retired.push_back(removed);
-        current_id = ancestor.page;
-        current = std::move(parent);
-    }
-    // All structural links/metadata now omit these pages. Allocation remains append-only.
-    for (PageId id : retired) pool_.Invalidate({FileKind::Database, id});
-    ++epoch_;
-    return true;
 }
 
 }  // namespace valencedb

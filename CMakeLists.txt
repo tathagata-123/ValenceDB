@@ -47,7 +47,7 @@ set(VALENCEDB_TEST_TARGETS
     valencedb_buffer_pool_tests
     valencedb_heap_catalog_tests
     valencedb_bplus_insert_tests
-    valencedb_bplus_delete_tests
+    valencedb_index_integration_tests
     valencedb_execution_tests
     valencedb_external_sort_tests
     valencedb_nested_loop_join_tests
@@ -61,7 +61,7 @@ add_executable(valencedb_storage_primitives_tests tests/storage_primitives_test.
 add_executable(valencedb_buffer_pool_tests tests/buffer_pool_test.cpp)
 add_executable(valencedb_heap_catalog_tests tests/heap_catalog_test.cpp)
 add_executable(valencedb_bplus_insert_tests tests/bplus_insert_test.cpp)
-add_executable(valencedb_bplus_delete_tests tests/bplus_delete_test.cpp)
+add_executable(valencedb_index_integration_tests tests/index_integration_test.cpp)
 add_executable(valencedb_execution_tests tests/execution_test.cpp)
 add_executable(valencedb_external_sort_tests tests/external_sort_test.cpp)
 add_executable(valencedb_nested_loop_join_tests tests/nested_loop_join_test.cpp)
@@ -106,7 +106,7 @@ add_test(NAME valencedb_storage_primitives COMMAND valencedb_storage_primitives_
 add_test(NAME valencedb_buffer_pool COMMAND valencedb_buffer_pool_tests)
 add_test(NAME valencedb_heap_catalog COMMAND valencedb_heap_catalog_tests)
 add_test(NAME valencedb_bplus_insert COMMAND valencedb_bplus_insert_tests)
-add_test(NAME valencedb_bplus_delete COMMAND valencedb_bplus_delete_tests)
+add_test(NAME valencedb_index_integration COMMAND valencedb_index_integration_tests)
 add_test(NAME valencedb_execution COMMAND valencedb_execution_tests)
 add_test(NAME valencedb_external_sort COMMAND valencedb_external_sort_tests)
 add_test(NAME valencedb_nested_loop_join COMMAND valencedb_nested_loop_join_tests)
