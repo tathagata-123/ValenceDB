@@ -161,6 +161,29 @@ void Selectivity() {
     Near(EstimateSelectivity(&s, 2, {0, CompareOp::Less, 0}), .5L);
     Near(EstimateNDV(&s, 1), 1);
 }
+
+void FractionalCardinality() {
+    const ColumnStatistics sampled{0, 3, 4, {0, 1, 2, 3}};
+    const ColumnStatistics* sources[] = {nullptr, &sampled};
+    struct Case { long double rows, heuristic_ndv, sampled_ndv, sampled_equality; };
+    const Case cases[] = {{0, 0, 0, 0}, {0.25L, 0.25L, 0.25L, 1},
+                          {1, 1, 1, 1}, {100, 10, 4, 0.25L}};
+    for (const auto* stats : sources) {
+        Near(EstimateNDV(stats, -1), 0);
+        for (const auto& c : cases) {
+            const auto ndv = EstimateNDV(stats, c.rows);
+            VDB_CHECK(0 <= ndv && ndv <= c.rows);
+            Near(ndv, stats ? c.sampled_ndv : c.heuristic_ndv);
+            for (int64_t value : {-1, 2, 4}) {
+                const auto fraction = EstimateSelectivity(stats, c.rows, {0, CompareOp::Equal, value});
+                VDB_CHECK(0 <= fraction && fraction <= 1);
+                const auto fallback = c.rows == 0 ? 0.0L : 0.1L;
+                Near(fraction, stats ? (value == 2 ? c.sampled_equality : 0) : fallback);
+            }
+        }
+    }
+}
+
 void ScanChoices() {
     Files f;
     Database db(f.db, OpenMode::CreateNew, f.temp, 16);
@@ -476,6 +499,57 @@ void GraceFallback() {
     VDB_CHECK(Run(q, p).size() == 10000);
     VDB_CHECK(actual->Metrics().fallback_pairs == 1);
 }
+
+void EquijoinKeyNDV() {
+    Files f;
+    Database db(f.db, OpenMode::CreateNew, f.temp, 8);
+    Fill(db, "r", 1000, 1); // All zero.
+    Fill(db, "s", 1000);    // Each key from 0 to 999 occurs once.
+    Fill(db, "empty", 0);
+    const QueryResources resources{32768, 4096};
+    PlanOptions options;
+    options.join = JoinChoice::GHJ;
+    const auto check_group = [&](QuerySpec spec, size_t key, const std::vector<long double>& ndv,
+                                 int64_t matches) {
+        spec.aggregate = AggregateSpec{key, std::nullopt, true};
+        QueryContext q(db, resources);
+        auto p = ChoosePlan(q, spec, options);
+        const auto& join = p.plan.children.at(0);
+        VDB_CHECK(join.kind == PlanKind::GHJ && join.ndv == ndv);
+        Near(join.rows, matches);
+        Near(join.row_upper_bound, db.Table(spec.left.table).live_rows * db.Table(spec.right->table).live_rows);
+        Near(p.plan.rows, matches ? 1 : 0);
+        Bag expected;
+        if (matches) {
+            VDB_CHECK(p.plan.kind == PlanKind::HashAggregate);
+            expected.push_back(EncodeTuple(p.plan.schema, Tuple({Value(int64_t{0}), Value(matches)})));
+        }
+        VDB_CHECK(Run(q, p) == expected);
+    };
+    for (size_t key : {0, 1}) {
+        check_group(Join("r", "s"), key, {1, 1}, 1000);
+        check_group(Join("s", "r"), key, {1, 1}, 1000);
+        check_group(Join("r", "empty"), key, {0, 0}, 0);
+        check_group(Join("empty", "s"), key, {0, 0}, 0);
+    }
+    {
+        QueryContext q(db, resources);
+        auto p = ChoosePlan(q, Join("r", "s"), options);
+        const auto pair = EncodeTuple(p.plan.schema, Tuple({Value(int64_t{0}), Value(int64_t{0})}));
+        VDB_CHECK(Run(q, p) == Bag(1000, pair));
+    }
+
+    db.CreateTable("remap", Schema(SchemaKind::Base, {{"unique", TypeId::Int64},
+        {"payload", TypeId::Int64}, {"constant", TypeId::Int64}}));
+    for (int64_t i = 0; i < 12; ++i) db.Insert("remap", Tuple({Value(i), Value(i % 3), Value(int64_t{0})}));
+    db.Analyze("remap");
+    auto spec = Join("remap", "remap");
+    spec.left.projection = ProjectionPlan{{0, 2}};
+    spec.right->projection = ProjectionPlan{{1, 0}};
+    spec.join = EquiJoinSpec{1, 1}; // Left constant = right unique, at output positions 1 and 3.
+    for (size_t key : {1, 3}) check_group(spec, key, {12, 1, 3, 1}, 12);
+}
+
 void AggregateChoices() {
     Files f;
     Database db(f.db, OpenMode::CreateNew, f.temp, 8);
@@ -547,6 +621,8 @@ void AggregateChoices() {
         QueryContext q(db, {32768, 4096});
         auto p = ChoosePlan(q, spec, o);
         VDB_CHECK(p.plan.kind == (algorithm == AggregateChoice::HashAggregate ? PlanKind::HashAggregate : PlanKind::SortAggregate));
+        VDB_CHECK((p.plan.ordering == Ordering{algorithm == AggregateChoice::SortAggregate, 0}));
+        VDB_CHECK(p.root->OutputOrdering() == p.plan.ordering);
         VDB_CHECK(Run(q, p) == expected);
     }
     // Run the actual high-NDV forced hash spill and compare bags with raw SortAggregate.
@@ -556,6 +632,53 @@ void AggregateChoices() {
     s.aggregate = AggregateChoice::SortAggregate;
     VDB_CHECK(Execute(db, spec, h, {65536, 4096}) == Execute(db, spec, s, {65536, 4096}));
 }
+
+void GlobalCountOrdering() {
+    Files f;
+    Database db(f.db, OpenMode::CreateNew, f.temp, 8);
+    Fill(db, "empty", 0);
+    Fill(db, "numbers", 4);
+    for (int64_t count : {0, 4}) for (bool with_sum : {false, true}) {
+        QueryContext q(db, {1500, 4096});
+        auto spec = Scan(count ? "numbers" : "empty");
+        spec.aggregate = AggregateSpec{std::nullopt, std::nullopt, true};
+        spec.order_column = 0;
+        PlanOptions options;
+        if (with_sum) {
+            spec.aggregate->measure_column = 0;
+            spec.aggregate->sum = true;
+            Throws([&] { (void)ChoosePlan(q, spec); }, "no feasible physical plan");
+            options.aggregate_memory = 1528; // Two output columns need 3 * 168 + 1024 combine bytes.
+        }
+        auto p = ChoosePlan(q, spec, options);
+        VDB_CHECK(p.plan.kind == PlanKind::GlobalAggregate && !Find(p.plan, PlanKind::ExternalSort));
+        VDB_CHECK((p.plan.ordering == Ordering{true, 0}));
+        VDB_CHECK(p.plan.schema.column(0).type == TypeId::Int64 && !p.plan.schema.column(0).nullable);
+        const auto check_replay = [&](Executor& aggregate) {
+            VDB_CHECK(aggregate.OutputOrdering() == p.plan.ordering);
+            for (int pass = 0; pass < 2; ++pass) {
+                if (pass) aggregate.Close();
+                aggregate.Init();
+                Tuple row({});
+                VDB_CHECK(aggregate.Next(row) && row.value(0).as_int64() == count);
+                if (with_sum) {
+                    VDB_CHECK(count ? row.value(1).as_int64() == 6 : row.value(1).is_null());
+                }
+                VDB_CHECK(!aggregate.Next(row));
+                VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 0 && db.Metrics().active_pins == 0);
+            }
+        };
+        SortAggregate direct(q, *spec.aggregate,
+            std::make_unique<SeqScan>(q, SeqScanPlan{spec.left.table}), options.aggregate_memory);
+        check_replay(direct);
+        VDB_CHECK(!direct.Metrics().used_internal_sort);
+        direct.Close();
+        check_replay(*p.root);
+        q.FinishQuery(*p.root);
+        VDB_CHECK(q.Succeeded() && db.Disk().PageCount(FileKind::Temporary) == 0);
+    }
+}
+
 void GlobalAndValidation() {
     Files f;
     Database db(f.db, OpenMode::CreateNew, f.temp, 8);
@@ -582,6 +705,11 @@ void GlobalAndValidation() {
     invalid.aggregate = AggregateSpec{std::nullopt, 0, false, true};
     invalid.order_column = 0;
     Throws([&] { (void)ChoosePlan(q, invalid); }, "NONNULL INT64");
+    invalid.aggregate = AggregateSpec{std::nullopt, 0, true, true, true, true, true};
+    for (size_t key : {1, 2, 3, 4}) { // SUM, MIN, MAX and AVG alongside COUNT.
+        invalid.order_column = key;
+        Throws([&] { (void)ChoosePlan(q, invalid); }, "NONNULL INT64");
+    }
     invalid = Scan("t");
     invalid.right = BaseAccess{"empty", {}, std::nullopt};
     Throws([&] { (void)ChoosePlan(q, invalid); }, "appear together");
@@ -919,6 +1047,8 @@ void PipelineAndExplain() {
 int main(int argc, char** argv) {
     const std::vector<std::pair<std::string, std::function<void()>>> cases{
         {"statistics", Statistics}, {"selectivity", Selectivity}, {"scans", ScanChoices},
+        {"fractional_cardinality", FractionalCardinality}, {"equijoin_key_ndv", EquijoinKeyNDV},
+        {"global_count_ordering", GlobalCountOrdering},
         {"ordering", OrderAndProjection}, {"feasible_alternatives", FeasibleAlternatives}, {"joins", JoinChoices}, {"replay_costs", ReplayCosts},
         {"forced_joins", ForcedJoins}, {"grace_fallback", GraceFallback}, {"aggregates", AggregateChoices}, {"validation", GlobalAndValidation},
         {"memory_costs", MemoryAndCost}, {"plan_structure", PlanStructure}, {"pipeline_explain", PipelineAndExplain}};

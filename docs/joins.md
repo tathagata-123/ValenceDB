@@ -164,7 +164,7 @@ Each owned input tuple is appended once to `PartitionHash(key) % p`. PartitionHa
 
 The two vector<TempRun> arrays contain at most p sealed values each and remain bounded until Close. Descriptors borrow the operator’s immutable left/right schemas. Empty writers finish with zero pages. Each writer owns a private 4096-byte image; brief BufferPool guards copy/allocate pages. Writers are retained through unique_ptr for straightforward simultaneous partition construction. The complete writer vector dies before the opposite side or hash build begins; no reader/writer retains a guard across calls.
 
-Init ends at SelectPair, with all partition writers gone and no hash state. Next processes corresponding `(Li,Ri)` only. It skips a pair with either side empty without constructing readers, a table, or fallback. Each finished pair's handles are destroyed before selecting the next.
+Init ends at SelectPair, with all partition writers gone and no hash state. Next processes corresponding `(Li,Ri)` only. It skips a pair with either side empty without constructing readers, a table, or fallback. `ReleasePair` releases the current pair's working state and advances the pair index. Both vectors keep their partition descriptors through EOF.
 
 ### Local memory and side choice
 
@@ -209,13 +209,13 @@ through the ordinary scratch page format and verify failure, no BNLJ retry,
 no successful EOF, and checked resource cleanup. Successful writer counts are
 exact; general scratch-corruption recovery remains outside V1.
 
-Probe EOF destroys the reader, table nodes/buckets, current tuple, and both pair handles. There is only one active hash table, never a table collection or output queue. Close likewise destroys all active state and both partition vector capacities, closes children, and preserves metric snapshots. The summary counters retain no partition records, relations, or tuples.
+At probe EOF, `ReleasePair` resets the reader and match iterators, destroys the hash table and releases the current tuple. At fallback EOF it destroys the BNLJ executor and its TempScans. `Close` releases any active pair and both partition descriptor vectors, closes the children, and preserves the summary counters.
 
 ### Oversized pairs and skew fallback
 
 Fallback creates a fresh Nested-loop join BlockNestedLoopJoin over **two TempScans of this pair**, passing the numeric `M-Dghj`. The descriptors remain live, and no hash allocation remains. BNLJ applies its existing S/Touter formula; there is no second full-M grant or generic sub-budget layer. Choose a legal physical outer giving fewer `ceil(rows/C_block)` inner scans; ties choose Left. The choice is local and deterministic, not optimizer join selection.
 
-Next delegates directly to fallback.Next until EOF, then destroys the entire fallback before releasing the pair. TempScan replays the materialized inner partition, never an original child. The tested 120-by-130 all-key-7 pair exceeds both 36-row hash capacities and emits exactly **15600** rows through one fallback, with C_block=57 and three inner scans under M_fallback=19744. A wide-left/narrow-right fixture forces Right outer and matches standalone Nested-loop join BNLJ under the same reduced allowance.
+Next delegates to the fallback until EOF, records its completed inner scans, and calls `ReleasePair`. TempScan replays the materialized inner partition. The tested 120-by-130 all-key-7 pair exceeds both 36-row hash capacities and emits exactly **15600** rows through one fallback, with C_block=57 and three inner scans under M_fallback=19744. A wide-left/narrow-right fixture forces Right outer and matches standalone Nested-loop join BNLJ under the same reduced allowance.
 
 There is deliberately no recursive repartitioning. BNLJ guarantees termination with bounded retained state, reuses Nested-loop join, and keeps the algorithm inspectable. Severe skew can make comparisons and output quadratic. Output cardinality never increases retained output state.
 
@@ -237,7 +237,7 @@ Total: one hash pair, one fallback pair, one empty pair; 8556 rows
 
 Row/page counts remain solely in the sealed TempRuns. There is no per-partition metric vector or synthetic completed-read accounting. Tests decode partitions, check routing and tuple multisets, independently pack the original input to predict strategies and page scans, and compare expected transfers against BufferPool fetch deltas. Peak occupancies, capacity formulas and boundary fixtures verify admission and reduced memory bounds without private executor inspection. DiskManager temporary reads, writes, and allocations remain the source of completed physical file-I/O evidence, including work completed before a failure. Failed transfers propagate errors rather than incrementing these counters.
 
-TempStore's `allocated_temp_pages` counts successful allocations across the **query**, including other operators. Physical DiskManager extent enforces the cap even if a NewPage installation fails. No subtraction on pair release occurs. Close and dropping descriptors perform **zero page-reclamation I/O**: no chain walk, reuse, or shrink. All pages, including released pairs, failed tails, and previous replay executions, count until checked FinishQuery or query cancellation resets scratch. TempScan/BNLJ fallback allocates no new temp pages. A downstream ExternalSort or a replay can exhaust the cap after old pair handles have been closed; tests cover both and propagate DbError, never truncated success.
+TempStore's `allocated_temp_pages` counts successful allocations across the **query**, including other operators. Physical DiskManager extent enforces the cap even if a NewPage installation fails. Pair release and executor Close perform zero page-reclamation I/O. Pages for completed pairs, failed tails, and previous executions count until checked FinishQuery or query cancellation resets scratch. TempScan/BNLJ fallback allocates no new temp pages. Tests cover a downstream ExternalSort and a replay exhausting the cap after earlier pairs finish.
 
 With ideal equal packing, original input page counts N_R/N_S, and every pair fitting the second phase, classic GHJ costs `3*(N_R+N_S)`: read original inputs, write partitions, read partitions. It excludes output writing. ValenceDB's measurable logical approximation is:
 

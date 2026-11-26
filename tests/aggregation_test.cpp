@@ -211,7 +211,8 @@ AggregateMetrics Run(Database& db, const std::vector<Tuple>& rows, AggregateSpec
     const auto metrics = hash ? static_cast<HashAggregate&>(*a).Metrics() : static_cast<SortAggregate&>(*a).Metrics();
     VDB_CHECK(metrics.output_groups == result.size());
     VDB_CHECK(source.inits == 1 && source.delivered == rows.size() && source.calls == rows.size() + 1);
-    VDB_CHECK(a->OutputOrdering() == (hash || !spec.group_column ? Ordering{} : Ordering{true, 0}));
+    const bool ordered = spec.group_column ? !hash : spec.count;
+    VDB_CHECK((a->OutputOrdering() == Ordering{ordered, 0}));
     if (hash) {
         auto& h = static_cast<HashAggregate&>(*a);
         VDB_CHECK(metrics.peak_hash_groups <= h.Memory().hash_group_capacity);

@@ -22,6 +22,26 @@ void CheckName(const std::string& name, size_t maximum) {
     if (name.empty() || name.size() > maximum || name.find('\0') != std::string::npos)
         throw DbError("invalid catalog name length or embedded NUL");
 }
+
+bool SameSchema(const Schema& a, const Schema& b) {
+    if (a.kind() != b.kind() || a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const auto& left = a.column(i);
+        const auto& right = b.column(i);
+        if (left.name != right.name || left.type != right.type ||
+            left.varchar_limit != right.varchar_limit || left.nullable != right.nullable) return false;
+    }
+    return true;
+}
+
+void WriteMutableMeta(PageBytes& page, const TableInfo& info) {
+    WriteU32(page, 16, info.first_page);
+    WriteU32(page, 20, info.last_page);
+    WriteU64(page, 24, info.live_rows);
+    WriteU32(page, 32, info.heap_pages);
+    WriteU16(page, 36, info.index_col);
+    WriteU32(page, 40, info.index_meta);
+}
 }
 
 void Catalog::Initialize(PageBytes& page, PageId id) {
@@ -91,13 +111,8 @@ TableInfo Catalog::DecodeMeta(const PageBytes& page, PageId id, const std::strin
 void Catalog::EncodeMeta(PageBytes& page, const TableInfo& info) {
     page.fill(std::byte{0});
     WritePageHeader(page, PageType::TableMeta, info.meta_page);
-    WriteU32(page, 16, info.first_page);
-    WriteU32(page, 20, info.last_page);
-    WriteU64(page, 24, info.live_rows);
-    WriteU32(page, 32, info.heap_pages);
-    WriteU16(page, 36, info.index_col);
+    WriteMutableMeta(page, info);
     WriteU16(page, 38, static_cast<uint16_t>(info.schema.size()));
-    WriteU32(page, 40, info.index_meta);
     for (size_t i = 0; i < info.schema.size(); ++i) {
         const auto& col = info.schema.column(i);
         const size_t at = kSchemaStart + i * kColumn;
@@ -113,13 +128,17 @@ TableInfo Catalog::CreateTable(const std::string& name, const Schema& schema) {
     for (size_t i = 0; i < schema.size(); ++i) CheckName(schema.column(i).name, 23);
     if (tables_.size() >= 16) throw DbError("catalog is full");
     for (const auto& table : tables_) if (table.name == name) throw DbError("duplicate table name");
+    auto directory = pool_.Fetch({FileKind::Database, 1});
+    ValidatePageHeader(directory.Data(), PageType::Catalog, 1);
+    if (ReadU16(directory.Data(), 16) != tables_.size()) throw DbError("catalog table count changed");
+    directory.Drop();
+
     auto meta = pool_.NewPage(FileKind::Database);
     TableInfo info{name, meta.Page().page_id, schema};
     EncodeMeta(meta.MutableData(), info);
     meta.MarkDirty();
     meta.Drop();
-    auto directory = pool_.Fetch({FileKind::Database, 1});
-    ValidatePageHeader(directory.Data(), PageType::Catalog, 1);
+    directory = pool_.Fetch({FileKind::Database, 1});
     const size_t at = kCatalogHeader + tables_.size() * kEntry;
     std::memcpy(directory.MutableData().data() + at, name.data(), name.size());
     WriteU32(directory.MutableData(), at + 32, info.meta_page);
@@ -143,11 +162,17 @@ std::vector<std::string> Catalog::TableNames() const {
 void Catalog::Save(const TableInfo& info) {
     for (auto& table : tables_) {
         if (table.name != info.name || table.meta_page != info.meta_page) continue;
+        if (!SameSchema(table.schema, info.schema)) throw DbError("table schema is immutable");
         auto guard = pool_.Fetch({FileKind::Database, info.meta_page});
         ValidatePageHeader(guard.Data(), PageType::TableMeta, info.meta_page);
-        EncodeMeta(guard.MutableData(), info);
+        WriteMutableMeta(guard.MutableData(), info);
         guard.MarkDirty();
-        table = info;
+        table.first_page = info.first_page;
+        table.last_page = info.last_page;
+        table.live_rows = info.live_rows;
+        table.heap_pages = info.heap_pages;
+        table.index_col = info.index_col;
+        table.index_meta = info.index_meta;
         return;
     }
     throw DbError("table metadata is not in catalog");

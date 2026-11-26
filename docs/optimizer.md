@@ -25,7 +25,7 @@ context.FinishQuery(*chosen.root);
 
 `BaseAccess` has `table`, `predicates` (AND), and optional `projection`. Predicates use **base-table** positions and execute before that projection. `EquiJoinSpec` keys use **access-output** positions. A join always produces logical Left followed by Right, regardless of physical outer. `AggregateSpec` uses this joined schema, or the single access schema. ORDER BY uses positions before the final projection; the final projection can retain/remap or remove that order. These positions are explicit rather than inferred from names. Invalid columns/types and inconsistent shapes throw `DbError`. Multiple joins, order/group keys, directions, and arbitrary expressions are not representable in the typed API.
 
-Automatic projection pruning is omitted: extra payload survives unless the caller supplies a ProjectionPlan. `ProjectedSchema` and `ProjectedOrdering` are the shared execution helpers, so the first surviving occurrence of the ordered column is remapped; removing it loses the ordering proof. Filter preserves order; joins and HashAggregate are conservatively unordered. SortAggregate exposes ascending output column 0. Sorting nullable global SUM/MIN/MAX or DOUBLE AVG is rejected; there is no NULL comparator. COUNT(*) needs no measure. Global aggregation uses the existing single-state HashAggregate path, without group table or sort.
+Accesses retain all payload columns unless the caller supplies a ProjectionPlan. `ProjectedSchema` and `ProjectedOrdering` remap ordering to the first surviving copy of the ordered column. Removing that column loses the ordering proof. Filter preserves order. Joins and grouped HashAggregate are unordered. Grouped SortAggregate orders by the group key in output column 0. Global aggregation uses a single state. When COUNT is present, its one result row already satisfies ascending order on COUNT in column 0. ORDER BY still requires a NONNULL INT64 key, which excludes nullable global SUM/MIN/MAX and DOUBLE AVG. COUNT(*) needs no measure.
 
 `OptimizedPlan` owns one `unique_ptr<Executor> root` and its inspectable `PhysicalPlan` descriptor. It carries no resource/options snapshot, rejection history or separate sort-elision metadata. Database outlives QueryContext, which outlives that root. Descriptors are inspection results, not a separate mutable executable-plan API. Candidates are small value trees; only the winner constructs executor objects, and planning never calls Init. SortAggregate retains its actual input as its child. `NeedsInternalSort()` derives the internal-sort requirement from the group key and that child's ordering; the executor constructs its sorter once with the reduced allowance. `Build()` recursively constructs each child and switches on the operator kind, without skipping nodes.
 
@@ -54,9 +54,13 @@ Statistics may influence plan choice but never query correctness. Stale samples 
 
 ## Selectivity and cardinality
 
-`EstimateSelectivity` uses `1/NDV` for in-range equality and zero for a value outside sampled-snapshot exact min/max. Range estimates use an inclusive integer domain, `(max-min+1)`, with endpoint comparisons performed in INT64 and unsigned differences before floating conversion. This avoids signed overflow, division by zero, and cancellation for adjacent values near signed extremes. Clamp every fraction to [0,1]. Without useful min/max, equality uses 0.1 and inequalities use 1/3. Missing NDV uses sqrt(current rows), bounded to [1,rows]; empty is zero.
+`EstimateNDV` returns zero for nonpositive row estimates. For `0 < rows < 1`, the expected NDV equals the row estimate. At one row or more, it clamps the sampled NDV or the `sqrt(rows)` fallback to `[1, rows]`.
 
-Filter conjunction estimates multiply the individual fractions. This assumes independence, including a deliberately crude treatment of overlapping predicates on one column. Index bounds use the minimum individual bound fraction; filter-prefix estimates are capped by access rows so the bounds are not applied twice. All filters still execute. Join rows use `left_rows*right_rows/max(1,left_NDV,right_NDV)`; group count uses the selected key NDV capped by estimated input rows. These assumptions can be wrong, especially for skew or correlated columns. Scan nodes identify their statistics source as fresh sampled, stale-sampled, or heuristic. Row exactness and conservative bounds remain in the descriptor for feasibility; EXPLAIN shows the estimated row count.
+`EstimateSelectivity` returns zero for nonpositive row estimates. For positive rows, equality uses `1/max(1, NDV)` inside the known min/max and zero outside. Range estimates use an inclusive integer domain, `(max-min+1)`, with endpoint comparisons performed in INT64 and unsigned differences before floating conversion. This avoids signed overflow, division by zero, and cancellation for adjacent values near signed extremes. Without useful min/max, equality uses 0.1 and inequalities use 1/3.
+
+Filter conjunction estimates multiply the individual fractions. This assumes independence, including a deliberately crude treatment of overlapping predicates on one column. Index bounds use the minimum individual bound fraction. Each filter prefix caps its estimate at the access row count to avoid applying the bounds twice. All filters still execute.
+
+Join rows use `left_rows*right_rows/max(1,left_NDV,right_NDV)`. Each output NDV is capped by the estimated join rows. The two equijoin keys then receive the smaller of their capped NDVs, a simple estimate of the size of the intersection. Grouping by either copy consequently predicts the same number of groups. Skew and correlated columns can affect the accuracy of these estimates. Scan nodes identify their statistics source as fresh sampled, stale-sampled, or heuristic. The descriptor carries row exactness and conservative bounds for feasibility. EXPLAIN shows the estimated row count.
 
 Costs/cardinalities use `long double`, including multiplication before any narrowing. No row-count product is computed in uint64_t. Exact raw counts also supply conservative row upper bounds (join Cartesian product, filters do not reduce the bound). Sampled selectivity never serves as a proof of memory feasibility.
 
@@ -113,7 +117,7 @@ For BNLJ at M=18200, S=14664, a 40-row narrow side has C=29 and two inner execut
 
 ## Sort and aggregate work
 
-`EstimateSort(schema, rows, row_upper_bound, exact_rows, resources, bytes)` is a pure helper returning local cost, initial runs, and merge levels. Explicit ExternalSort, SortAggregate internal sorting, and HashAggregate partial sorting all call it; estimation constructs no plan or executor.
+`EstimateSort(schema, rows, row_upper_bound, exact_rows, resources, bytes)` returns a `ModeledCost` containing local page transfers and CPU work. It computes the initial run count and merge levels locally. Explicit ExternalSort, SortAggregate internal sorting, and HashAggregate partial sorting all use this estimate.
 
 Let r=ceil(estimated rows/C_sort). If r<=1, modeled temp work is zero. Otherwise let L be the number of repeated `r=ceil(r/k)` reductions until r<=k. ExternalSort local page work is `(2L+2)*N`: initial writes, L intermediate read/write levels, and final streamed reads. Child input is **not** charged again. There is no materialized final output. A 150-row wide forced SeqScan plan at M=32768 has C_sort=8, k=2, 19 initial runs, four materialized levels, local sort pages=300 and subtree pages=330.
 
@@ -157,11 +161,11 @@ or the formulas above when studying capacities. M is per operator, not whole-que
 RSS; sampled row/cost estimates cannot guarantee that runtime caps will suffice.
 
 The `pipeline_explain` fixture runs filter → join → aggregate → sort → projection
-against an independent reference. Its exact EXPLAIN output is recorded in the
-[V1 verification report](v1_algorithm_first.md). The result has four groups;
-the estimated five groups illustrate approximate join/group NDV. The final
-projection remaps ordered group column 0 to output column 1. Equivalent automatic
-and forced index variants match the same reference bag.
+against an independent reference. The filtered join keys have estimated NDVs of
+five and four. Applying the smaller estimate to both keys predicts four groups,
+matching the four groups returned here. The final projection remaps ordered group
+column 0 to output column 1. Automatic and forced index variants match the same
+reference bag. The earlier plan is recorded in the [Phase 5 report](v1_algorithm_first.md).
 
 ## Limits
 
@@ -171,6 +175,6 @@ The optimizer excludes SQL, more than one binary join, multiple group/order/join
 
 Read [statistics.cpp](../src/optimizer/statistics.cpp) and [optimizer.cpp](../src/optimizer/optimizer.cpp). `Scans`, `Joins`, `Aggregates`, `EstimateSort`, `Sort`, and `Build` are local concrete helpers; `ChoosePlan` and `Explain` are the public free functions. Planning owns small value candidate trees and builds executors only for the winner. QueryContext must outlive the returned root.
 
-At most two access alternatives per side, five unforced join alternatives (NLJ/BNLJ each orientation, one GHJ), and two grouped aggregate alternatives produce a small bounded enumeration for the fixed one-join shape. Predicate/projection processing is linear in the supplied lists per candidate; there is no factorial multi-join search. Analyze scans rows once and retains at most 1024 values per INT64 column plus bounded sorted-copy scratch. Planning itself performs no statistics scan and no temp execution.
+At most two access alternatives per side, five unforced join alternatives (NLJ/BNLJ each orientation, one GHJ), and two grouped aggregate alternatives produce a small bounded enumeration for the fixed one-join shape. Evaluating the selectivities of p predicates takes O(p) work per access candidate. Constructing the filter chain takes O(p²) copying because each new Filter owns a value copy of the entire preceding plan. Analyze scans rows once and retains at most 1024 values per INT64 column plus bounded sorted-copy scratch. Planning itself performs no statistics scan and no temp execution.
 
 For a surprising choice, compare local versus subtree terms, selected inner replay cost, width-derived capacities, and required final ordering before questioning arithmetic. Sampled cardinalities are advisory; independent exact upper bounds govern conservative feasibility. Forced algorithms reject impossible configurations. The optimizer tests cover replay costs, memory feasibility, deterministic tie-breaking, forced alternatives, aggregation choices, and EXPLAIN output.

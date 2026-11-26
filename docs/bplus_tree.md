@@ -222,5 +222,5 @@ is tested for unchanged persistent bytes and cursor validity.
 | Internal `Initialize`, `ChildCount`, `Child`, `Separator` | Initialize headers and access bounded internal fields. |
 | Internal `Write`, `Validate` | Serialize children/separators and check page identity/capacity. |
 | Metadata `Read`, `Write` | Decode/encode root, height, and key column with validity checks. |
-| `CheckRID`, `CheckKey`, `CheckMeta`, `CheckReserved`, `ReadKey`, `WriteKey` | Small local input/field checks and composite-key codecs. |
+| `CheckRID`, `CheckKey`, `CheckMeta`, `ReadKey`, `WriteKey` | Validate RID page IDs and metadata fields, and decode or encode composite keys. |
 | Iterator constructor / `Next` | Capture epoch and scan position; yield one owned entry with no retained pin. |

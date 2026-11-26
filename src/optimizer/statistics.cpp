@@ -63,6 +63,7 @@ void Database::StaleStatistics(const std::string& name) {
 }
 long double EstimateNDV(const ColumnStatistics* stats, long double rows) {
     if (rows <= 0) return 0;
+    if (rows < 1) return rows;
     return std::clamp(stats && stats->approximate_ndv > 0 ? stats->approximate_ndv : std::sqrt(rows),
                       1.0L, rows);
 }
@@ -72,7 +73,7 @@ long double EstimateSelectivity(const ColumnStatistics* s, long double rows, con
         return p.op == CompareOp::Equal ? 0.1L : 1.0L / 3;
     const int64_t low = *s->minimum, high = *s->maximum, value = p.constant;
     if (p.op == CompareOp::Equal)
-        return value < low || value > high ? 0 : 1 / EstimateNDV(s, rows);
+        return value < low || value > high ? 0 : 1 / std::max(1.0L, EstimateNDV(s, rows));
     // Compare endpoints in INT64 first. Unsigned differences avoid signed overflow
     // and cancellation near INT64_MIN/MAX, including on double-width long double.
     const auto distance = [](int64_t a, int64_t b) -> long double {

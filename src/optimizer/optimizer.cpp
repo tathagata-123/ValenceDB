@@ -195,6 +195,10 @@ Plans Joins(const Plans& left, const Plans& right, const EquiJoinSpec& keys,
                     n.ndv = l.ndv;
                     n.ndv.insert(n.ndv.end(), r.ndv.begin(), r.ndv.end());
                     for (auto& d : n.ndv) d = std::min(d, n.rows);
+                    const size_t right_key = l.schema.size() + keys.right_key;
+                    const auto key_ndv = std::min(n.ndv[keys.left_key], n.ndv[right_key]);
+                    n.ndv[keys.left_key] = key_ndv;
+                    n.ndv[right_key] = key_ndv;
                     const auto& outer = side == PhysicalOuter::Left ? l : r;
                     const auto& inner = side == PhysicalOuter::Left ? r : l;
                     if (kind == PlanKind::GHJ) {
@@ -243,7 +247,8 @@ Plans Aggregates(const Plans& children, const AggregateSpec& spec, const QueryRe
                 n.rows = spec.group_column ? std::min(child.rows, child.ndv[*spec.group_column]) : 1;
                 n.row_upper_bound = spec.group_column ? child.row_upper_bound : 1;
                 n.ndv.assign(schema.size(), n.rows);
-                n.ordering = {};
+                // COUNT leads the single global result, including on empty input.
+                n.ordering = {spec.group_column ? kind == PlanKind::SortAggregate : spec.count, 0};
                 n.local_cost.cpu = child.rows;
                 if (!spec.group_column || kind == PlanKind::HashAggregate) {
                     const auto memory = ComputeHashAggregateMemory(resources, child.schema, schema,
@@ -270,7 +275,6 @@ Plans Aggregates(const Plans& children, const AggregateSpec& spec, const QueryRe
                     const auto memory = ComputeSortAggregateMemory(resources, child.schema, schema,
                         n.NeedsInternalSort(), options.aggregate_memory);
                     n.memory_bytes = memory.max_bytes;
-                    n.ordering = {true, 0};
                     if (n.NeedsInternalSort()) {
                         const auto sort = EstimateSort(child.schema, child.rows, child.row_upper_bound,
                             child.exact_rows, resources, memory.sort_memory_bytes);

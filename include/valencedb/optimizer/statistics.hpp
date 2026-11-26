@@ -16,6 +16,7 @@ struct TableStatistics {
     std::vector<ColumnStatistics> columns; // VARCHAR entries stay empty.
 };
 // Advisory only: these functions never simplify or remove executable predicates.
+// Below one expected row, positive rows are also the expected NDV. Equality uses a divisor of at least one.
 long double EstimateNDV(const ColumnStatistics* stats, long double rows);
 long double EstimateSelectivity(const ColumnStatistics* stats, long double rows,
                                 const Int64Predicate& predicate);

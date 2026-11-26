@@ -289,6 +289,93 @@ void CatalogValidation() {
     reopened.Close();
 }
 
+void StaleCatalogCreation() {
+    Files files("stale_catalog");
+    Database db(files.db, OpenMode::CreateNew, files.temp, 1);
+    Catalog stale(db.Buffer()); // The database already owns the first catalog handle.
+    const auto alpha = db.CreateTable("alpha", Schema2());
+    const auto rid = db.Insert("alpha", Row(7, "seven"));
+    const auto pages = db.Disk().PageCount(FileKind::Database);
+    Throws([&] { stale.CreateTable("bravo", Schema1()); });
+    VDB_CHECK(db.Disk().PageCount(FileKind::Database) == pages);
+    VDB_CHECK(stale.TableNames().empty());
+    VDB_CHECK(db.Table("alpha").meta_page == alpha.meta_page);
+    db.CreateTable("charlie", Schema1());
+    VDB_CHECK(db.Metrics().active_pins == 0 && db.Metrics().peak_pins == 1);
+    db.Close();
+
+    Database reopened(files.db, OpenMode::OpenExisting, files.temp, 1);
+    VDB_CHECK((reopened.TableNames() == std::vector<std::string>{"alpha", "charlie"}));
+    const auto table = reopened.Table("alpha");
+    VDB_CHECK(table.meta_page == alpha.meta_page && table.live_rows == 1);
+    VDB_CHECK(table.schema.column(1).name == "tag" && table.schema.column(1).varchar_limit == 256);
+    const auto row = reopened.Fetch("alpha", rid);
+    VDB_CHECK(row);
+    CheckRow(*row, 7, "seven");
+    reopened.Close();
+}
+
+void ImmutableCatalogSchema() {
+    Files files("immutable_schema");
+    const Column id{std::string(23, 'i'), TypeId::Int64};
+    const Column tag{"tag", TypeId::Varchar, 32};
+    const Schema schema(SchemaKind::Base, {id, tag});
+    Database db(files.db, OpenMode::CreateNew, files.temp, 1);
+    const PageId meta = db.CreateTable("rows", schema).meta_page;
+    {
+        auto page = db.Buffer().Fetch({FileKind::Database, meta});
+        // Readers ignore descriptor padding. A whole-page rewrite would erase this byte.
+        page.MutableData()[64 + 28] = std::byte{0x5a};
+        page.MarkDirty();
+    }
+    const auto first = db.Insert("rows", Row(7, "seven"));
+    const auto removed = db.Insert("rows", Row(8, "eight"));
+    VDB_CHECK(db.Delete("rows", removed));
+    db.CreateIndex("rows", 0);
+    const auto last = db.Insert("rows", Row(9, "nine"));
+    const auto index = db.Index("rows").MetaPage();
+    const auto check_metadata = [&](const TableInfo& table) {
+        VDB_CHECK(table.name == "rows" && table.meta_page == meta);
+        VDB_CHECK(table.schema.kind() == SchemaKind::Base && table.schema.size() == 2);
+        const auto& a = table.schema.column(0);
+        const auto& b = table.schema.column(1);
+        VDB_CHECK(a.name == id.name && a.type == TypeId::Int64 && !a.nullable && a.varchar_limit == 0);
+        VDB_CHECK(b.name == tag.name && b.type == TypeId::Varchar && !b.nullable && b.varchar_limit == 32);
+        VDB_CHECK(table.first_page == first.page_id && table.last_page == last.page_id);
+        VDB_CHECK(table.live_rows == 2 && table.heap_pages == 1);
+        VDB_CHECK(table.index_col == 0 && table.index_meta == index);
+    };
+    Catalog catalog(db.Buffer());
+    const PageBytes before = db.Buffer().Fetch({FileKind::Database, meta}).Data();
+    const auto reject = [&](const TableInfo& replacement) {
+        // Each replacement also carries the mutable defaults of an empty, unindexed table.
+        Throws([&] { catalog.Save(replacement); });
+        check_metadata(catalog.Find("rows"));
+        VDB_CHECK(db.Buffer().Fetch({FileKind::Database, meta}).Data() == before);
+    };
+    reject({"rows", meta, Schema(SchemaKind::Base, {{"renamed", TypeId::Int64}, tag})});
+    reject({"rows", meta, Schema(SchemaKind::Base, {id, {"tag", TypeId::Int64}})});
+    reject({"rows", meta, Schema(SchemaKind::Base, {id, {"tag", TypeId::Varchar, 31}})});
+    reject({"rows", meta, Schema(SchemaKind::Base, {id})});
+    reject({"rows", meta, Schema(SchemaKind::Intermediate, {id, tag})});
+    reject({"rows", meta, Schema(SchemaKind::Intermediate, {id, {"tag", TypeId::Varchar, 32, true}})});
+    reject({"renamed", meta, schema});
+    reject({"rows", index, schema});
+    VDB_CHECK(before[64 + 28] == std::byte{0x5a});
+    db.Close();
+
+    Database reopened(files.db, OpenMode::OpenExisting, files.temp, 1);
+    check_metadata(reopened.Table("rows"));
+    const auto seven = reopened.Fetch("rows", first);
+    const auto nine = reopened.Fetch("rows", last);
+    VDB_CHECK(seven && nine && !reopened.Fetch("rows", removed));
+    CheckRow(*seven, 7, "seven");
+    CheckRow(*nine, 9, "nine");
+    VDB_CHECK(reopened.Index("rows").Contains(7, first) && reopened.Index("rows").Contains(9, last));
+    VDB_CHECK(reopened.Metrics().active_pins == 0 && reopened.Metrics().peak_pins == 1);
+    reopened.Close();
+}
+
 void CompactionAndDirectoryExhaustion() {
     PageBytes page{};
     SlottedPage::Initialize(page, 4, 2);
@@ -398,6 +485,8 @@ int main() {
         HeapDirectoryExhaustion();
         DatabaseRoundTrip();
         CatalogValidation();
+        StaleCatalogCreation();
+        ImmutableCatalogSchema();
         CrossOwner();
         RandomizedRows();
         std::cout << "heap and catalog tests passed\n";

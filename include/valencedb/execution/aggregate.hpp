@@ -39,7 +39,7 @@ public:
                   std::optional<size_t> memory_bytes = std::nullopt);
     ~HashAggregate() noexcept override { Close(); }
     const Schema& OutputSchema() const override { return schema_; }
-    Ordering OutputOrdering() const override { return {}; }
+    Ordering OutputOrdering() const override { return {!spec_.group_column && spec_.count, 0}; }
     const AggregateMemory& Memory() const noexcept { return memory_; }
     const AggregateMetrics& Metrics() const noexcept { return metrics_; }
 private:
@@ -70,7 +70,7 @@ public:
                   std::optional<size_t> memory_bytes = std::nullopt);
     ~SortAggregate() noexcept override { Close(); }
     const Schema& OutputSchema() const override { return schema_; }
-    Ordering OutputOrdering() const override { return {spec_.group_column.has_value(), 0}; }
+    Ordering OutputOrdering() const override { return {spec_.group_column.has_value() || spec_.count, 0}; }
     const AggregateMemory& Memory() const noexcept { return memory_; }
     const AggregateMetrics& Metrics() const noexcept { return metrics_; }
 private:

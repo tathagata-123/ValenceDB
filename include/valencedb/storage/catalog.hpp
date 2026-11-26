@@ -12,6 +12,8 @@ struct TableInfo {
     std::string name;
     PageId meta_page;
     Schema schema;
+
+    // Save updates only these heap and index fields.
     PageId first_page = kInvalidPageId;
     PageId last_page = kInvalidPageId;
     uint64_t live_rows = 0;

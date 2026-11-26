@@ -54,6 +54,8 @@ AVG is finalized once as `double(sum) / double(count)`. Partial state always ret
 
 Both APIs use one state and consume their raw child once. They allocate no hash table, temporary relation, or sorter. HashAggregate consumes during Init, then its first Next finalizes one row. SortAggregate opens its child in Init and consumes/finalizes on its first Next. The following Next observes EOF. This remains constant state for arbitrarily many input rows, subject to checked arithmetic and child limits.
 
+When COUNT is requested, column 0 of that single row is a NONNULL INT64. Both executors advertise ascending order on column 0, so an ORDER BY on COUNT is already satisfied even for empty input.
+
 ## Bounded HashAggregate
 
 Grouped Init calls BuildGroups with the owned table and a local optional writer. Persistent phases describe only output: EmitHash, CombinePartials, EmitGlobal and Done. No setup phase needs to survive a call.
@@ -69,11 +71,9 @@ For every owned input row, first look up its key. Existing groups update in plac
 
 The loop's owned Tuple remains alive throughout the flush, so no replay, duplicate fetch, or lost trigger is necessary. There is only one writer accumulating the partial page chain across all batches. Repeated keys reduce table pressure; row count alone never causes a spill. Tests fill the table exactly and continue updating existing keys, and also perform 20,000 updates across two keys without spilling.
 
-After the final partial batch, BuildGroups returns optional<TempRun> from Finish. It explicitly destroys the table including buckets before returning; the local writer staging page and input tuple also die on return. Init constructs the sorter afterward; TempScan copies the returned descriptor. No partial descriptor or writer remains in HashAggregate. The existing combine scratch allowance covers these small value copies and reader metadata; the separate page allowance covers TempScan staging.
-
 If no overflow occurred, close the child and stream finalized rows directly from the stable bounded map. There is no separate collection of output rows and no temporary allocation.
 
-If any overflow occurred, EOF requires flushing **every remaining map entry** as the final nonempty batch. Finish the writer, destroy the writer and its private page, close the consumed raw child, and destroy the **entire map including buckets**. The local input Tuple has also left scope. Only then create and initialize the internal ExternalSort over a TempScan of the completed partial run. A source assertion and test inspection check this ownership transition. Merely clearing the map would retain its large reservation and is insufficient here.
+On the spill path, `BuildGroups` closes the child at EOF, flushes the remaining groups, and finishes the partial run. `FlushBatch` clears the entries. The subsequent `table_.reset()` destroys the map and its reserved buckets. The local writer, its staging page, and the input tuple leave scope when `BuildGroups` returns. Only then does `DoInit` construct ExternalSort over a TempScan of the sealed run. Combine scratch covers the run descriptor and reader metadata, with a separate page allowance for TempScan staging.
 
 Worked example with capacity=2:
 
@@ -99,7 +99,7 @@ Unused fields remain initialized zero and are ignored during combination. There 
 
 The ExternalSort operator sorts these partial rows by column 0. It retains bounded runs, uses real temporary pages and intermediate merge passes, and streams its final merge. It never sees the raw child. Sorted equal keys combine through AggregateState::Combine. On a key boundary, retain one owned lookahead partial, emit the current finalized state, and resume that next key on the following Next. EOF emits the last group. No complete final result is materialized.
 
-HashAggregate always advertises unordered output. Its spill path's internal sorted order is not an API promise.
+Grouped HashAggregate advertises unordered output on both its in-memory and spill paths.
 
 ## SortAggregate and lookahead
 
@@ -116,7 +116,7 @@ On unordered input, the constructor creates the existing ExternalSort with a red
 
 For input 1:a,1:b,2:c, the first Next reads c to discover the boundary, saves that row, and emits group 1. The second Next starts group 2 from c exactly once. If EOF follows c, it still emits group 2. Repeated EOF returns false without modifying the caller's output. Ordered Init does not preconsume input; a single group may naturally require reading all its rows before that group's output is ready.
 
-Grouped SortAggregate advertises `Ordering{true,0}` and emits strictly increasing distinct keys. Global aggregation has no useful key order. Both algorithms share small state/finalization and adjacent-group helpers, without a generic aggregate-function hierarchy or phase framework.
+Grouped SortAggregate advertises `Ordering{true,0}` and emits strictly increasing distinct keys. Both algorithms share the state, finalization, and adjacent-group helpers.
 
 ## Modeled memory and phase ownership
 
