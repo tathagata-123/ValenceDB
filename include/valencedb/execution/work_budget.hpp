@@ -10,6 +10,7 @@ struct QueryResources {
     size_t max_temp_pages = 16384;
     void Validate() const;
 };
+// Capacity helpers check the selected memory allowance; QueryContext validates query resources.
 size_t ResolveBudget(const QueryResources& resources,
                                    std::optional<size_t> override_bytes = std::nullopt);
 size_t CheckedAdd(size_t a, size_t b);

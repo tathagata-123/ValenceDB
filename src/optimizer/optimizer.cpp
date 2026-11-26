@@ -15,9 +15,6 @@ long double PackedPages(const Schema& s, long double rows) {
     const size_t per_page = (kPageSize - 32) / (s.max_encoded_bytes() + 4);
     return std::ceil(rows / per_page);
 }
-void Rejected(std::vector<std::string>& reasons, const std::string& reason) {
-    if (std::find(reasons.begin(), reasons.end(), reason) == reasons.end()) reasons.push_back(reason);
-}
 const char* Name(PlanKind k) {
     switch (k) {
         case PlanKind::SeqScan: return "SeqScan";
@@ -64,13 +61,8 @@ PhysicalPlan Project(const PhysicalPlan& child, const ProjectionPlan& projection
     for (size_t c : projection.columns) n.ndv.push_back(child.ndv[c]);
     return n;
 }
-struct SortEstimate {
-    ModeledCost cost;
-    long double initial_runs;
-    size_t merge_levels;
-};
 // Sort work only: the caller pays for its input path. Exact bounds govern feasibility.
-SortEstimate EstimateSort(const Schema& schema, long double rows, long double row_upper_bound,
+ModeledCost EstimateSort(const Schema& schema, long double rows, long double row_upper_bound,
                           bool exact_rows, const QueryResources& resources, size_t bytes) {
     const auto m = ComputeSortMemory(resources, schema, bytes);
     if (row_upper_bound > m.run_capacity && m.merge_fan_in < 2)
@@ -85,8 +77,8 @@ SortEstimate EstimateSort(const Schema& schema, long double rows, long double ro
         ++levels;
     }
     const long double pages = PackedPages(schema, rows);
-    return {{runs <= 1 ? 0 : (2 * levels + 2) * pages,
-             rows * std::log2(std::max(2.0L, rows))}, runs, levels};
+    return {runs <= 1 ? 0 : (2 * levels + 2) * pages,
+            rows * std::log2(std::max(2.0L, rows))};
 }
 PhysicalPlan Sort(const PhysicalPlan& child, size_t key, const QueryResources& resources, size_t bytes) {
     ValidateInt64Key(child.schema, key);
@@ -96,12 +88,12 @@ PhysicalPlan Sort(const PhysicalPlan& child, size_t key, const QueryResources& r
     n.column = key;
     n.ordering = {true, key};
     n.memory_bytes = bytes;
-    n.local_cost = estimate.cost;
+    n.local_cost = estimate;
     n.subtree_cost = Add(child.subtree_cost, n.local_cost);
     return n;
 }
 Plans Scans(QueryContext& context, const BaseAccess& access, ScanChoice choice, ScanRingChoice ring,
-            std::optional<size_t> useful_key, std::vector<std::string>& rejected) {
+            std::optional<size_t> useful_key) {
     const auto table = context.Db().Table(access.table);
     const auto* stats = context.Db().Statistics(access.table);
     const auto column_stats = [&](size_t c) -> const ColumnStatistics* {
@@ -134,10 +126,7 @@ Plans Scans(QueryContext& context, const BaseAccess& access, ScanChoice choice, 
     for (auto kind : {PlanKind::SeqScan, PlanKind::IndexScan}) {
         if ((choice == ScanChoice::SeqScan && kind != PlanKind::SeqScan) ||
             (choice == ScanChoice::IndexScan && kind != PlanKind::IndexScan)) continue;
-        if (kind == PlanKind::IndexScan && (table.index_meta == kInvalidPageId || !relevant)) {
-            Rejected(rejected, "IndexScan rejected: no matching index access/order requirement on " + access.table);
-            continue;
-        }
+        if (kind == PlanKind::IndexScan && (table.index_meta == kInvalidPageId || !relevant)) continue;
         PhysicalPlan n(kind, table.schema);
         n.rows = table.live_rows;
         n.exact_rows = true;
@@ -181,7 +170,7 @@ Plans Scans(QueryContext& context, const BaseAccess& access, ScanChoice choice, 
     return result;
 }
 Plans Joins(const Plans& left, const Plans& right, const EquiJoinSpec& keys,
-            const QueryResources& resources, const PlanOptions& options, std::vector<std::string>& rejected) {
+            const QueryResources& resources, const PlanOptions& options) {
     Plans result;
     for (const auto& l : left) for (const auto& r : right) {
         ValidateInt64Key(l.schema, keys.left_key);
@@ -229,14 +218,17 @@ Plans Joins(const Plans& left, const Plans& right, const EquiJoinSpec& keys,
                                              n.local_cost);
                     }
                     result.push_back(std::move(n));
-                } catch (const DbError& e) { Rejected(rejected, std::string(Name(kind)) + " rejected: " + e.what()); }
+                } catch (const DbError&) {
+                    // This candidate cannot meet the execution memory requirements; try the next.
+                    continue;
+                }
             }
         }
     }
     return result;
 }
 Plans Aggregates(const Plans& children, const AggregateSpec& spec, const QueryResources& resources,
-                 const PlanOptions& options, std::vector<std::string>& rejected) {
+                 const PlanOptions& options) {
     Plans result;
     for (const auto& child : children) {
         const auto schema = AggregateOutputSchema(child.schema, spec);
@@ -270,7 +262,7 @@ Plans Aggregates(const Plans& children, const AggregateSpec& spec, const QueryRe
                                 const auto pages = PackedPages(partial_schema, child.rows);
                                 // Partial write + TempScan read, combination CPU, then sort work.
                                 n.local_cost = Add(n.local_cost, {2 * pages, child.rows});
-                                n.local_cost = Add(n.local_cost, sort.cost);
+                                n.local_cost = Add(n.local_cost, sort);
                             }
                         }
                     }
@@ -282,12 +274,15 @@ Plans Aggregates(const Plans& children, const AggregateSpec& spec, const QueryRe
                     if (n.NeedsInternalSort()) {
                         const auto sort = EstimateSort(child.schema, child.rows, child.row_upper_bound,
                             child.exact_rows, resources, memory.sort_memory_bytes);
-                        n.local_cost = Add(n.local_cost, sort.cost);
+                        n.local_cost = Add(n.local_cost, sort);
                     }
                 }
                 n.subtree_cost = Add(n.children[0].subtree_cost, n.local_cost);
                 result.push_back(std::move(n));
-            } catch (const DbError& e) { Rejected(rejected, std::string(Name(kind)) + " rejected: " + e.what()); }
+            } catch (const DbError&) {
+                // A different aggregate/access order can still be feasible.
+                continue;
+            }
         }
     }
     return result;
@@ -333,23 +328,8 @@ void ValidateOptions(const QuerySpec& spec, const PlanOptions& o) {
     for (auto bytes : {o.sort_memory, o.join_memory, o.aggregate_memory})
         if (bytes && !*bytes) throw DbError("operator memory must be positive");
 }
-void ExplainSort(std::ostringstream& out, const std::string& indent, const Schema& schema,
-                 long double rows, long double row_upper_bound, bool exact_rows,
-                 const QueryResources& resources, size_t bytes) {
-    const auto m = ComputeSortMemory(resources, schema, bytes);
-    const auto estimate = EstimateSort(schema, rows, row_upper_bound, exact_rows, resources, bytes);
-    out << indent << "M=" << m.max_bytes << " Tinput=" << m.row_bytes << " S=" << m.scratch_bytes
-        << " D=" << m.descriptor_capacity << " R=" << m.descriptor_bytes << " C_sort=" << m.run_capacity
-        << " k=" << m.merge_fan_in << " initial_runs=" << estimate.initial_runs
-        << " merge_levels=" << estimate.merge_levels
-        << (estimate.initial_runs <= 1 ? " predicted private run (no temp)" : " final merge streamed");
-    if (std::ceil(row_upper_bound / m.run_capacity) > m.descriptor_capacity)
-        out << "; finite descriptor cap may reject at runtime";
-    out << '\n';
-}
-void ExplainNode(std::ostringstream& out, const PhysicalPlan& n, const QueryResources& resources, size_t depth) {
-    const std::string indent(depth * 2, ' ');
-    out << indent << Name(n.kind);
+void ExplainNode(std::ostringstream& out, const PhysicalPlan& n, size_t depth) {
+    out << std::string(depth * 2, ' ') << Name(n.kind);
     switch (n.kind) {
         case PlanKind::SeqScan:
             out << " table=" << n.seq.table << " scan_ring=" << (n.seq.use_scan_ring ? "on" : "off");
@@ -357,162 +337,76 @@ void ExplainNode(std::ostringstream& out, const PhysicalPlan& n, const QueryReso
         case PlanKind::IndexScan:
             out << " table=" << n.index.table << " index_column=" << n.index.column
                 << " range=[" << (n.index.low ? std::to_string(*n.index.low) : "MIN") << ','
-                << (n.index.high ? std::to_string(*n.index.high) : "MAX") << "] heap_fetches=" << n.rows;
+                << (n.index.high ? std::to_string(*n.index.high) : "MAX") << ']';
             break;
         case PlanKind::Filter: out << ' ' << PredicateText(*n.predicate); break;
         case PlanKind::Projection:
             out << " columns=";
-            for (size_t column : n.projection.columns) out << column << ' ';
+            for (size_t i = 0; i < n.projection.columns.size(); ++i)
+                out << (i ? "," : "") << n.projection.columns[i];
             break;
         case PlanKind::NLJ: case PlanKind::BNLJ: case PlanKind::GHJ:
             out << " keys=" << n.join.left_key << ',' << n.join.right_key;
-            if (n.kind == PlanKind::GHJ)
-                out << " skew uncertain; runtime BNLJ overflow fallback enabled";
-            else out << " physical_outer=" << (n.join.outer == PhysicalOuter::Left ? "Left" : "Right");
+            if (n.kind != PlanKind::GHJ)
+                out << " physical_outer=" << (n.join.outer == PhysicalOuter::Left ? "Left" : "Right");
             break;
         case PlanKind::GlobalAggregate: break;
         case PlanKind::HashAggregate: case PlanKind::SortAggregate:
             out << " group=" << *n.aggregate.group_column;
             if (n.kind == PlanKind::SortAggregate)
-                out << " internal_sort=" << (n.NeedsInternalSort() ? "yes" : "no")
-                    << " sort elided=" << (n.NeedsInternalSort() ? "no" : "yes");
+                out << " internal_sort=" << (n.NeedsInternalSort() ? "yes" : "no");
             break;
         case PlanKind::ExternalSort: out << " key=" << n.column; break;
     }
-    if (n.kind == PlanKind::SeqScan || n.kind == PlanKind::IndexScan) {
+    if (n.kind == PlanKind::SeqScan || n.kind == PlanKind::IndexScan)
         out << " [" << (n.statistics == StatisticsSource::Heuristic ? "heuristic" :
-            n.statistics == StatisticsSource::Stale ? "stale-sampled" : "fresh sampled") << ']';
-    }
-    long double input_rows = 0;
-    for (const auto& child : n.children) input_rows += child.rows;
-    out << '\n' << indent << "  estimated_rows=" << n.rows << " input_rows=" << input_rows
-        << " row_upper_bound=" << n.row_upper_bound << " exact_rows=" << (n.exact_rows ? "yes" : "no")
-        << " packed_pages=" << PackedPages(n.schema, n.rows)
-        << " local_cost=" << n.local_cost.Score() << " subtree_cost=" << n.subtree_cost.Score()
-        << " (local pages=" << n.local_cost.pages << ", cpu=" << n.local_cost.cpu << ")\n"
-        << indent << "  order=" << (n.ordering.ordered ? "ascending column " + std::to_string(n.ordering.column) : "unordered")
-        << " schema=[";
-    for (size_t c = 0; c < n.schema.size(); ++c) {
-        const auto& col = n.schema.column(c);
-        out << (c ? "," : "") << col.name << ':' << (col.type == TypeId::Int64 ? "INT64" : col.type == TypeId::Double ? "DOUBLE" : "VARCHAR")
-            << (col.nullable ? "?" : "");
-    }
-    out << "]\n";
-    if (n.kind == PlanKind::NLJ || n.kind == PlanKind::BNLJ) {
-        const auto& outer = n.children[n.join.outer == PhysicalOuter::Left ? 0 : 1];
-        const auto& inner = n.children[n.join.outer == PhysicalOuter::Left ? 1 : 0];
-        long double replays = outer.rows;
-        if (n.kind == PlanKind::BNLJ) {
-            const auto m = ComputeBlockJoinMemory(resources, outer.schema, inner.schema, n.schema, n.memory_bytes);
-            replays = std::ceil(outer.rows / m.block_capacity);
-            out << indent << "  M=" << m.max_bytes << " Touter=" << m.outer_row_bytes << " S=" << m.scratch_bytes
-                << " C_block=" << m.block_capacity << '\n';
-        }
-        out << indent << "  inner_executions=" << replays
-            << " inner_replay_cost=" << inner.subtree_cost.Score() * replays << '\n';
-    }
-    if (n.kind == PlanKind::GHJ) {
-        const auto m = ComputeGraceJoinMemory(resources, n.children[0].schema, n.children[1].schema, n.schema, n.memory_bytes);
-        out << indent << "  M=" << m.max_bytes << " S=" << m.scratch_bytes << " p=" << m.partition_count
-            << " Dghj=" << m.descriptor_bytes << " build_capacities=" << m.left_build_capacity << ',' << m.right_build_capacity
-            << " fallback_M=" << m.fallback_memory << '\n';
-    }
-    if (n.kind == PlanKind::GlobalAggregate || n.kind == PlanKind::HashAggregate || n.kind == PlanKind::SortAggregate) {
-        const auto& child = n.children[0];
-        const auto m = n.kind == PlanKind::SortAggregate
-            ? ComputeSortAggregateMemory(resources, child.schema, n.schema, n.NeedsInternalSort(), n.memory_bytes)
-            : ComputeHashAggregateMemory(resources, child.schema, n.schema, n.aggregate.group_column.has_value(), n.memory_bytes);
-        out << indent << "  M=" << m.max_bytes << " S=" << m.scratch_bytes << " group_capacity=" << m.hash_group_capacity
-            << " internal_sort_budget=" << m.sort_memory_bytes << '\n';
-        if (n.NeedsInternalSort()) {
-            ExplainSort(out, indent + "  internal sort: ", child.schema, child.rows, child.row_upper_bound,
-                        child.exact_rows, resources, m.sort_memory_bytes);
-        }
-        if (n.kind == PlanKind::HashAggregate) {
-            const bool spill = n.rows > m.hash_group_capacity;
-            out << indent << "  predicted spill=" << (spill ? "yes" : "no") << " [uncertain]; output unordered\n";
-            if (child.row_upper_bound > m.hash_group_capacity) {
-                ExplainSort(out, indent + "  partial sort (if spill): ", AggregatePartialSchema(),
-                            spill ? child.rows : 0, child.row_upper_bound, false, resources, m.sort_memory_bytes);
-            }
-        }
-    }
-    if (n.kind == PlanKind::ExternalSort) {
-        const auto& child = n.children[0];
-        ExplainSort(out, indent + "  ", child.schema, child.rows, child.row_upper_bound,
-                    child.exact_rows, resources, *n.memory_bytes);
-    }
-    for (const auto& child : n.children) ExplainNode(out, child, resources, depth + 1);
+            n.statistics == StatisticsSource::Stale ? "stale-sampled" : "sampled") << ']';
+    out << " rows=" << n.rows << " cost=" << n.subtree_cost.Score()
+        << " (pages=" << n.subtree_cost.pages << ", cpu=" << n.subtree_cost.cpu
+        << ") local=" << n.local_cost.Score()
+        << " order=" << (n.ordering.ordered ? "asc(" + std::to_string(n.ordering.column) + ")" : "none");
+    if (n.memory_bytes) out << " M=" << *n.memory_bytes;
+    out << '\n';
+    for (const auto& child : n.children) ExplainNode(out, child, depth + 1);
 }
 }  // namespace
 
 OptimizedPlan ChoosePlan(QueryContext& context, const QuerySpec& spec, const PlanOptions& options) {
     context.CheckActive();
     ValidateOptions(spec, options);
-    std::vector<std::string> rejected;
     const auto useful = spec.join ? std::optional<size_t>(spec.join->left_key) :
         spec.aggregate ? spec.aggregate->group_column : spec.order_column;
-    auto candidates = Scans(context, spec.left, options.left_scan, options.scan_ring, useful, rejected);
+    auto candidates = Scans(context, spec.left, options.left_scan, options.scan_ring, useful);
     if (spec.join) {
-        auto right = Scans(context, *spec.right, options.right_scan, options.scan_ring, spec.join->right_key, rejected);
-        candidates = Joins(candidates, right, *spec.join, context.Resources(), options, rejected);
+        auto right = Scans(context, *spec.right, options.right_scan, options.scan_ring, spec.join->right_key);
+        candidates = Joins(candidates, right, *spec.join, context.Resources(), options);
     }
-    if (spec.aggregate) candidates = Aggregates(candidates, *spec.aggregate, context.Resources(), options, rejected);
+    if (spec.aggregate) candidates = Aggregates(candidates, *spec.aggregate, context.Resources(), options);
     std::optional<PhysicalPlan> best;
-    std::optional<size_t> elided_order_column;
     for (auto candidate : candidates) {
+        if (spec.order_column) ValidateInt64Key(candidate.schema, *spec.order_column);
         try {
-            std::optional<size_t> elided_order;
-            if (spec.order_column) {
-                ValidateInt64Key(candidate.schema, *spec.order_column);
-                if (candidate.ordering == Ordering{true, *spec.order_column})
-                    elided_order = spec.order_column;
-                else candidate = Sort(candidate, *spec.order_column, context.Resources(),
-                                       options.sort_memory.value_or(context.Resources().work_memory_bytes));
-            }
-            if (spec.projection) candidate = Project(candidate, *spec.projection);
-            const auto score = candidate.subtree_cost.Score();
-            // Stable enumeration wins relative ties; no dependency on container/hash iteration.
-            if (!best || score < best->subtree_cost.Score() - 1e-9L * std::max(1.0L, best->subtree_cost.Score())) {
-                best = std::move(candidate);
-                elided_order_column = elided_order;
-            }
-        } catch (const DbError& e) { Rejected(rejected, std::string("final pipeline rejected: ") + e.what()); }
+            if (spec.order_column && candidate.ordering != Ordering{true, *spec.order_column})
+                candidate = Sort(candidate, *spec.order_column, context.Resources(),
+                                 options.sort_memory.value_or(context.Resources().work_memory_bytes));
+        } catch (const DbError&) {
+            // An ordered access or aggregate may avoid this infeasible sort.
+            continue;
+        }
+        if (spec.projection) candidate = Project(candidate, *spec.projection);
+        const auto score = candidate.subtree_cost.Score();
+        // Stable enumeration wins relative ties; no dependency on container/hash iteration.
+        if (!best || score < best->subtree_cost.Score() - 1e-9L * std::max(1.0L, best->subtree_cost.Score()))
+            best = std::move(candidate);
     }
-    if (!best) {
-        std::string message = "no feasible physical plan";
-        for (const auto& reason : rejected) message += "; " + reason;
-        throw DbError(message);
-    }
+    if (!best) throw DbError("no feasible physical plan");
     auto executor = Build(context, *best);
-    return {std::move(*best), std::move(executor), context.Resources(), context.Db().Buffer().FrameCount(),
-            std::move(rejected), options, elided_order_column};
+    return {std::move(*best), std::move(executor)};
 }
 std::string Explain(const OptimizedPlan& plan) {
     std::ostringstream out;
-    out << std::setprecision(5) << "ValenceDB estimated algorithmic logical page transfers + 0.0001 * tuple CPU operations\n"
-        << "F=" << plan.buffer_frames << " (shared BufferPool frames), max_temp_pages=" << plan.resources.max_temp_pages
-        << '\n'
-        << "Work memory is per heavyweight operator; simultaneously live operators each have their own M.\n"
-        << "Algorithmic accounting, not a whole-query RSS guarantee. Estimates are not runtime measurements;\n"
-        << "allocation initialization/cache effects are omitted; runtime TempStore enforces the cumulative cap.\n";
-    const auto& options = plan.options;
-    if (options.left_scan != ScanChoice::Auto)
-        out << "[forced scan] left=" << (options.left_scan == ScanChoice::SeqScan ? "SeqScan" : "IndexScan") << '\n';
-    if (options.right_scan != ScanChoice::Auto)
-        out << "[forced scan] right=" << (options.right_scan == ScanChoice::SeqScan ? "SeqScan" : "IndexScan") << '\n';
-    if (options.join != JoinChoice::Auto) out << "[forced join] " <<
-        (options.join == JoinChoice::NLJ ? "NLJ" : options.join == JoinChoice::BNLJ ? "BNLJ" : "GHJ") << '\n';
-    if (options.outer) out << "[forced outer] " << (*options.outer == PhysicalOuter::Left ? "Left" : "Right") << '\n';
-    if (options.aggregate != AggregateChoice::Auto) out << "[forced aggregate] " <<
-        (options.aggregate == AggregateChoice::HashAggregate ? "HashAggregate" : "SortAggregate") << '\n';
-    if (options.scan_ring != ScanRingChoice::Auto)
-        out << "[forced scan ring] " << (options.scan_ring == ScanRingChoice::On ? "on" : "off") << '\n';
-    if (plan.elided_order_column)
-        out << "Final Sort eliminated: input already ordered by column " << *plan.elided_order_column
-            << " before final projection\n";
-    ExplainNode(out, plan.plan, plan.resources, 0);
-    for (const auto& reason : plan.rejected) out << reason << '\n';
+    out << std::setprecision(5) << "Estimated cost = logical page transfers + 0.0001 * tuple CPU operations\n";
+    ExplainNode(out, plan.plan, 0);
     return out.str();
 }
 

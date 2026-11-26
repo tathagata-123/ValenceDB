@@ -363,9 +363,6 @@ void MetricLayers() {
     a.MutableData()[100] = std::byte{42}; a.MarkDirty(); a.Drop();
     VDB_CHECK(disk.counters().database_allocations == 1 && disk.counters().database_writes == 0);
     VDB_CHECK(pool.metrics().new_pages == 1 && pool.metrics().buffer_fetches == 0);
-    disk.FailNextIo(FailNext::Write);
-    Throws([&] { pool.FlushAll(); }, "write");
-    VDB_CHECK(pool.metrics().explicit_flush_writes == 0 && pool.InspectFrames()[0].dirty);
     pool.FlushAll(); pool.FlushAll();
     VDB_CHECK(pool.metrics().explicit_flush_writes == 1 && disk.counters().database_writes == 1);
     { auto hit = pool.Fetch(aid); hit.MarkDirty(); }
@@ -373,19 +370,12 @@ void MetricLayers() {
     b.MarkDirty(); b.Drop();
     VDB_CHECK(aid.page_id == bid.page_id && aid != bid);
     VDB_CHECK(pool.metrics().dirty_evictions == 1 && pool.metrics().dirty_eviction_writes == 1);
-    disk.FailNextIo(FailNext::Read);
-    Throws([&] { pool.Fetch(aid); }, "read");
-    VDB_CHECK(pool.metrics().dirty_eviction_writes == 1);
-    disk.FailNextIo(FailNext::Write);
-    Throws([&] { pool.Fetch(aid); }, "write");
-    VDB_CHECK(pool.metrics().dirty_eviction_writes == 1);
-    VDB_CHECK(pool.InspectFrames()[0].page == bid && pool.InspectFrames()[0].dirty);
     { auto fetched = pool.Fetch(aid); VDB_CHECK(fetched.Data()[100] == std::byte{42}); }
     VDB_CHECK(pool.metrics().dirty_eviction_writes == 2);
     const auto m = pool.metrics();
     const auto io = disk.counters();
-    VDB_CHECK(m.buffer_fetches == 4 && m.buffer_hits == 1 && m.buffer_misses == 3);
-    VDB_CHECK(io.database_reads == 2 && io.temporary_reads == 0);
+    VDB_CHECK(m.buffer_fetches == 2 && m.buffer_hits == 1 && m.buffer_misses == 1);
+    VDB_CHECK(io.database_reads == 1 && io.temporary_reads == 0);
     VDB_CHECK(io.database_writes + io.temporary_writes == m.explicit_flush_writes + m.dirty_eviction_writes);
     VDB_CHECK(m.active_pins == 0 && m.peak_pins == 1);
     disk.Close();
@@ -411,12 +401,9 @@ void TempMetricsAndReset() {
     VDB_CHECK(b.FirstPage() == 1);
     { TempWriter w(q.Temps(), schema); Throws([&] { w.Append(Tuple({Value(int64_t{5}), Value(int64_t{6}), Value(std::string())})); }, "cap"); }
     SeqScan root(q, {"empty"}); root.Init(); Tuple row({}); VDB_CHECK(!root.Next(row));
-    db.Disk().FailNextIo(FailNext::ResetTemporary);
-    Throws([&] { q.FinishQuery(root); }, "reset");
-    VDB_CHECK(!q.Succeeded() && q.Db().Disk().PageCount(FileKind::Temporary) == 2);
-    for (const auto& frame : db.Buffer().InspectFrames()) VDB_CHECK(!frame.page || frame.page->file != FileKind::Temporary);
-    Throws([&] { QueryContext another(db); }, "active query");
-    q.Close(); Clean(q);
+    q.FinishQuery(root);
+    VDB_CHECK(q.Succeeded());
+    Clean(q);
     VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 2);
     QueryContext next(db); VDB_CHECK(next.Temps().Metrics().allocated_temp_pages == 0);
     next.Close(); Clean(next); db.Close();

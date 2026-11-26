@@ -99,10 +99,6 @@ PageId DiskManager::Allocate(FileKind kind) {
 
 void DiskManager::Read(PageRef page, PageBytes& out) {
     CheckPage(page);
-    if (fail_next_ == FailNext::Read) {
-        fail_next_ = FailNext::None;
-        throw DbError("injected page read failure");
-    }
     File& file = Select(page.file);
     file.stream.clear();
     file.stream.seekg(Offset(page.page_id));
@@ -116,10 +112,6 @@ void DiskManager::Read(PageRef page, PageBytes& out) {
 
 void DiskManager::Write(PageRef page, const PageBytes& data) {
     CheckPage(page);
-    if (fail_next_ == FailNext::Write) {
-        fail_next_ = FailNext::None;
-        throw DbError("injected page write failure");
-    }
     File& file = Select(page.file);
     file.stream.clear();
     file.stream.seekp(Offset(page.page_id));
@@ -154,10 +146,6 @@ void DiskManager::Close() {
 
 void DiskManager::ResetTemporary() {
     File& file = Select(FileKind::Temporary);
-    if (fail_next_ == FailNext::ResetTemporary) {
-        fail_next_ = FailNext::None;
-        throw DbError("injected temporary reset failure");
-    }
     Flush(FileKind::Temporary);
     file.stream.close();
     if (file.stream.fail()) throw DbError("temporary file close before reset failed");

@@ -28,7 +28,6 @@ public:
     TableInfo Find(const std::string& name) const;
     std::vector<std::string> TableNames() const;
     void Save(const TableInfo& info);
-    size_t TableCount() const noexcept { return tables_.size(); }
 
 private:
     BufferPool& pool_;

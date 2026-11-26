@@ -65,8 +65,8 @@ Internal:
 There are `child_count - 1` separators. The internal maximum is `floor((4096 - 32) / 20) + 1 = 204` children; non-root minimum is 102. Every reachable internal page has at least two children, including the root. Initialize prepares an internal header; Write supplies children before the page becomes reachable.
 
 Page helpers interpret guarded bytes and check identity, type/version,
-physical/configured capacity, and access bounds. Fixed header reserved fields
-remain checked. Each accessed key/RID or child ID is checked when decoded;
+physical/configured capacity, and access bounds. Unused header and RID padding
+is ignored on read; writers still zero it and tests audit the encoded format. Each accessed key/RID or child ID is checked when decoded;
 validation does not scan every entry or child. Write checks vector dimensions and
 capacity, and encodes the supplied sorted entries. Ordering and full structure
 are the algorithm's responsibility and are audited by the independent validator.

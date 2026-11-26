@@ -93,7 +93,7 @@ Schema version 6 uses nested JSON objects; 64-bit hash accumulators are hex stri
 | `config` | Complete parsed configuration, defaults included, seed and trial |
 | `build_type`, `compiler`, `platform` | CMake build/compiler/OS/architecture; runner also records observed platform strings |
 | `dataset` | Actual rows, heap pages, schema columns, maximum encoded bytes, modeled T, index state/height, total database file pages |
-| `physical_plans`, `explain` | Actual operator tree, ordering/ring/outer, estimates, resolved budgets, aggregate internal-sort property; EXPLAIN derives capacities and forcing markers |
+| `physical_plans`, `explain` | Actual operator tree, ordering/ring/outer, estimates, resolved budgets, aggregate internal-sort property; EXPLAIN displays compact selected-plan estimates; capacity detail remains under `algorithm` |
 | `algorithm` | Concrete executor's runtime counters and local memory derivations; GHJ includes summary pair/orientation/fallback counters; aggregates include internal sort counters/capacities |
 | `elapsed_ms`, `timing_boundary`, `buffer_state` | Measured interval and exact state/boundary description |
 | `result_rows`, `diagnostic_digest`, `ordered_digest` | Consumed row count and explicit stable diagnostic hashes |

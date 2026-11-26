@@ -43,6 +43,7 @@ public:
         VDB_CHECK(tree_.MetaPage() < allocated_);
         auto meta = pool_.Fetch({FileKind::Database, tree_.MetaPage()});
         ValidatePageHeader(meta.Data(), PageType::IndexMeta, tree_.MetaPage());
+        VDB_CHECK(ReadU32(meta.Data(), 12) == 0);
         VDB_CHECK(ReadU32(meta.Data(), 16) == tree_.RootPage());
         VDB_CHECK(ReadU16(meta.Data(), 20) == tree_.Height());
         VDB_CHECK(ReadU16(meta.Data(), 22) == tree_.KeyColumn());
@@ -85,6 +86,7 @@ private:
         ++shape_.nodes;
         auto guard = pool_.Fetch({FileKind::Database, id});
         const auto& page = guard.Data();
+        VDB_CHECK(ReadU32(page, 12) == 0);
         VDB_CHECK(ReadU16(page, 18) == 0 && ReadU64(page, 24) == 0);
         const uint16_t count = ReadU16(page, 16);
         if (depth == tree_.Height()) {

@@ -15,8 +15,6 @@ std::string ReadName(const PageBytes& page, size_t offset, size_t width) {
     size_t length = 0;
     while (length < width && page[offset + length] != std::byte{0}) ++length;
     if (length == 0 || length == width) throw DbError("invalid catalog name");
-    for (size_t i = length + 1; i < width; ++i)
-        if (page[offset + i] != std::byte{0}) throw DbError("nonzero name padding");
     return std::string(reinterpret_cast<const char*>(page.data() + offset), length);
 }
 
@@ -65,7 +63,7 @@ TableInfo Catalog::DecodeMeta(const PageBytes& page, PageId id, const std::strin
         const uint8_t type = std::to_integer<uint8_t>(page[at + 24]);
         const uint8_t flags = std::to_integer<uint8_t>(page[at + 25]);
         const uint16_t limit = ReadU16(page, at + 26);
-        if (type > 1 || flags != 0 || ReadU32(page, at + 28) != 0)
+        if (type > 1 || flags != 0)
             throw DbError("invalid column descriptor");
         columns.push_back({colname, type == 0 ? TypeId::Int64 : TypeId::Varchar, limit, false});
     }
@@ -115,8 +113,6 @@ TableInfo Catalog::CreateTable(const std::string& name, const Schema& schema) {
     for (size_t i = 0; i < schema.size(); ++i) CheckName(schema.column(i).name, 23);
     if (tables_.size() >= 16) throw DbError("catalog is full");
     for (const auto& table : tables_) if (table.name == name) throw DbError("duplicate table name");
-    if (kSchemaStart + schema.size() * kColumn > kPageSize)
-        throw DbError("table schema exceeds metadata page");
     auto meta = pool_.NewPage(FileKind::Database);
     TableInfo info{name, meta.Page().page_id, schema};
     EncodeMeta(meta.MutableData(), info);
@@ -124,7 +120,6 @@ TableInfo Catalog::CreateTable(const std::string& name, const Schema& schema) {
     meta.Drop();
     auto directory = pool_.Fetch({FileKind::Database, 1});
     ValidatePageHeader(directory.Data(), PageType::Catalog, 1);
-    if (ReadU16(directory.Data(), 16) != tables_.size()) throw DbError("catalog count changed");
     const size_t at = kCatalogHeader + tables_.size() * kEntry;
     std::memcpy(directory.MutableData().data() + at, name.data(), name.size());
     WriteU32(directory.MutableData(), at + 32, info.meta_page);

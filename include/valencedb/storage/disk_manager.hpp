@@ -9,7 +9,6 @@
 namespace valencedb {
 
 enum class OpenMode { CreateNew, OpenExisting };
-enum class FailNext { None, Read, Write, ResetTemporary };
 
 struct IoCounters {
     uint64_t database_reads = 0;
@@ -38,8 +37,6 @@ public:
     void ResetTemporary();
 
     const IoCounters& counters() const noexcept { return counters_; }
-    // Retained for executor/index error-propagation tests pending later V1 phases.
-    void FailNextIo(FailNext operation) noexcept { fail_next_ = operation; }
 
 private:
     struct File {
@@ -50,7 +47,6 @@ private:
     File database_;
     File temporary_;
     IoCounters counters_;
-    FailNext fail_next_ = FailNext::None;
     bool closed_ = false;
 
     static void OpenFile(File& file, OpenMode mode);

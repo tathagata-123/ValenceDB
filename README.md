@@ -119,12 +119,13 @@ At a high level:
                persistent file + scratch file
 ```
 
-`DiskManager` transfers physical pages. `BufferPool` caches them and mediates pin lifetimes through move-only guards. Heap, catalog, and B+ tree code interpret explicit on-disk formats. Executors exchange owned tuples, while external algorithms use query-scoped temporary relations through the same buffer pool. The planner estimates a small set of legal physical alternatives and constructs the selected executor tree without executing it. Its tagged plan nodes retain real children and resolved memory allowances; internal aggregate sorting is costed through a shared estimator and constructed by the aggregate. EXPLAIN derives descriptions and capacities after selection. See the [Phase 4 implementation report](docs/phase4_refactor.md) for verification and the comparison with Phase 3.
+`DiskManager` transfers physical pages. `BufferPool` caches them and mediates pin lifetimes through move-only guards. Heap, catalog, and B+ tree code interpret explicit on-disk formats. Executors exchange owned tuples, while external algorithms use query-scoped temporary relations through the same buffer pool. The planner estimates a small set of legal physical alternatives and constructs the selected executor tree without executing it. Its tagged plan nodes retain real children and resolved memory allowances; internal aggregate sorting is costed through a shared estimator and constructed by the aggregate. EXPLAIN displays the selected tree, estimated costs and cardinalities, ordering and memory allowances. See the [V1 audit and learning guide](docs/v1_algorithm_first.md) for scope, removals, source reading order and executed verification.
 
 ## Documentation
 
 | Topic | Document |
 |---|---|
+| V1 scope, audit, verification and learning guide | [Algorithm-first V1](docs/v1_algorithm_first.md) |
 | System organization and ownership | [Architecture](docs/architecture.md) |
 | Page, tuple, heap, and catalog formats | [Storage](docs/storage.md) |
 | CLOCK sweep, scan ring, and guard rules | [Buffer manager](docs/buffer_manager.md) |

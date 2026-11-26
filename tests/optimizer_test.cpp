@@ -177,7 +177,6 @@ void ScanChoices() {
         Near(scan->rows, 1);
         Near(scan->local_cost.pages, db.Index("t").Height() - 1 + 1 + 1);
         Near(p.plan.rows, 1);
-        VDB_CHECK(Explain(p).find("heap_fetches=1") != std::string::npos);
         std::cout << "selective scan: rows=" << scan->rows << " index pages=" << scan->local_cost.pages
                   << " versus SeqScan=" << db.Table("t").heap_pages << '\n';
         VDB_CHECK(Run(q, p).size() == 1);
@@ -200,7 +199,6 @@ void ScanChoices() {
         auto p = ChoosePlan(q, spec, o);
         const auto* scan = Find(p.plan, PlanKind::SeqScan);
         VDB_CHECK(scan && scan->seq.use_scan_ring == (ring != ScanRingChoice::Off));
-        VDB_CHECK(Explain(p).find("forced scan") != std::string::npos);
         q.Close();
     }
     PlanOptions index, seq;
@@ -247,7 +245,6 @@ void OrderAndProjection() {
         VDB_CHECK(p.plan.kind == PlanKind::IndexScan);
         VDB_CHECK(alternative.plan.kind == PlanKind::ExternalSort);
         VDB_CHECK(p.plan.subtree_cost.Score() < alternative.plan.subtree_cost.Score());
-        VDB_CHECK(Explain(p).find("Sort eliminated") != std::string::npos);
         std::cout << "order benefit: full IndexScan=" << p.plan.subtree_cost.Score()
                   << " SeqScan+sort=" << alternative.plan.subtree_cost.Score() << '\n';
         VDB_CHECK(Run(q, p).size() == 150);
@@ -285,6 +282,36 @@ void OrderAndProjection() {
         VDB_CHECK(Run(q, p).size() == 15);
     }
 }
+void FeasibleAlternatives() {
+    Files f;
+    Database db(f.db, OpenMode::CreateNew, f.temp, 8);
+    Fill(db, "t", 150);
+    db.CreateIndex("t", 0);
+    db.Analyze("t");
+    auto spec = Scan("t");
+    spec.order_column = 0;
+    {
+        QueryContext q(db, {3000, 4096}); // No sorter can initialize; ordered access is usable.
+        auto p = ChoosePlan(q, spec);
+        VDB_CHECK(p.plan.kind == PlanKind::IndexScan);
+        PlanOptions seq; seq.left_scan = ScanChoice::SeqScan;
+        Throws([&] { (void)ChoosePlan(q, spec, seq); }, "no feasible physical plan");
+        VDB_CHECK(Run(q, p).size() == 150);
+        VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 0);
+    }
+    spec.aggregate = AggregateSpec{0, std::nullopt, true};
+    {
+        QueryContext q(db, {3000, 4096}); // Hash grouping and unordered SortAggregate cannot fit.
+        auto p = ChoosePlan(q, spec);
+        VDB_CHECK(p.plan.kind == PlanKind::SortAggregate && !p.plan.NeedsInternalSort());
+        VDB_CHECK(Find(p.plan, PlanKind::IndexScan) && !Find(p.plan, PlanKind::ExternalSort));
+        PlanOptions hash; hash.aggregate = AggregateChoice::HashAggregate;
+        Throws([&] { (void)ChoosePlan(q, spec, hash); }, "no feasible physical plan");
+        VDB_CHECK(Run(q, p).size() == 150);
+        VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 0);
+    }
+}
+
 void JoinChoices() {
     Files f;
     Database db(f.db, OpenMode::CreateNew, f.temp, 8);
@@ -400,10 +427,8 @@ void ForcedJoins() {
             const auto expected_kind = algorithm == JoinChoice::NLJ ? PlanKind::NLJ :
                 algorithm == JoinChoice::BNLJ ? PlanKind::BNLJ : PlanKind::GHJ;
             VDB_CHECK(p.plan.kind == expected_kind);
-            VDB_CHECK(Explain(p).find("forced join") != std::string::npos);
             if (algorithm != JoinChoice::GHJ) {
                 VDB_CHECK(p.plan.join.outer == side);
-                VDB_CHECK(Explain(p).find("forced outer") != std::string::npos);
             }
             VDB_CHECK(p.root->OutputSchema().column(1).name == "value");
             VDB_CHECK(Run(q, p) == expected);
@@ -421,20 +446,18 @@ void ForcedJoins() {
         QueryContext q(db, {1, 4096});
         auto p = ChoosePlan(q, spec);
         VDB_CHECK(p.plan.kind == PlanKind::NLJ);
-        VDB_CHECK(Explain(p).find("BNLJ rejected") != std::string::npos);
-        VDB_CHECK(Explain(p).find("GHJ rejected") != std::string::npos);
         l.join = JoinChoice::BNLJ;
-        Throws([&] { (void)ChoosePlan(q, spec, l); }, "block join memory");
+        Throws([&] { (void)ChoosePlan(q, spec, l); }, "no feasible physical plan");
         PlanOptions g;
         g.join = JoinChoice::GHJ;
-        Throws([&] { (void)ChoosePlan(q, spec, g); }, "Grace join memory");
+        Throws([&] { (void)ChoosePlan(q, spec, g); }, "no feasible physical plan");
         q.Close();
     }
     {
         QueryContext q(db, {18000, 4096}); // Covers scratch, but p<2.
         PlanOptions g;
         g.join = JoinChoice::GHJ;
-        Throws([&] { (void)ChoosePlan(q, spec, g); }, "at least two partitions");
+        Throws([&] { (void)ChoosePlan(q, spec, g); }, "no feasible physical plan");
         auto p = ChoosePlan(q, spec);
         VDB_CHECK(p.plan.kind != PlanKind::GHJ);
         q.Close();
@@ -452,7 +475,6 @@ void GraceFallback() {
     VDB_CHECK(actual && p.plan.kind == PlanKind::GHJ);
     VDB_CHECK(Run(q, p).size() == 10000);
     VDB_CHECK(actual->Metrics().fallback_pairs == 1);
-    VDB_CHECK(Explain(p).find("runtime BNLJ overflow fallback") != std::string::npos);
 }
 void AggregateChoices() {
     Files f;
@@ -471,7 +493,6 @@ void AggregateChoices() {
         auto* actual = dynamic_cast<HashAggregate*>(p.root.get());
         VDB_CHECK(actual && actual->Memory().hash_group_capacity == 117);
         VDB_CHECK(actual->Memory().max_bytes == p.plan.memory_bytes);
-        VDB_CHECK(Explain(p).find("predicted spill=no") != std::string::npos);
         std::cout << "HashAggregate groups=3 capacity=117 score=" << p.plan.subtree_cost.Score() << '\n';
         VDB_CHECK(Run(q, p).size() == 3);
     }
@@ -492,7 +513,6 @@ void AggregateChoices() {
         h.aggregate = AggregateChoice::HashAggregate;
         auto hash = ChoosePlan(q, spec, h);
         VDB_CHECK(hash.plan.kind == PlanKind::HashAggregate);
-        VDB_CHECK(Explain(hash).find("predicted spill=yes") != std::string::npos);
         const long double partial_pages = std::ceil(1000.0L / 72);
         Near(hash.plan.local_cost.cpu, 3000 + 1000 * std::log2(1000.0L));
         Near(hash.plan.local_cost.pages, 12 * partial_pages); // write/read partial + 10 sort temp passes.
@@ -512,7 +532,7 @@ void AggregateChoices() {
         VDB_CHECK(p.plan.kind == PlanKind::SortAggregate);
         VDB_CHECK(Find(p.plan, PlanKind::IndexScan));
         VDB_CHECK(!Find(p.plan, PlanKind::ExternalSort));
-        VDB_CHECK(Explain(p).find("sort elided=yes") != std::string::npos);
+        VDB_CHECK(Explain(p).find("internal_sort=no") != std::string::npos);
         VDB_CHECK((p.plan.ordering == Ordering{true, 0}));
         std::cout << "ordered SortAggregate score=" << p.plan.subtree_cost.Score() << " sort elided\n";
         VDB_CHECK(Run(q, p).size() == 1);
@@ -527,7 +547,6 @@ void AggregateChoices() {
         QueryContext q(db, {32768, 4096});
         auto p = ChoosePlan(q, spec, o);
         VDB_CHECK(p.plan.kind == (algorithm == AggregateChoice::HashAggregate ? PlanKind::HashAggregate : PlanKind::SortAggregate));
-        VDB_CHECK(Explain(p).find("forced aggregate") != std::string::npos);
         VDB_CHECK(Run(q, p) == expected);
     }
     // Run the actual high-NDV forced hash spill and compare bags with raw SortAggregate.
@@ -580,7 +599,7 @@ void GlobalAndValidation() {
     Throws([&] { (void)ChoosePlan(q, invalid); }, "at least one output");
     PlanOptions o;
     o.left_scan = ScanChoice::IndexScan;
-    Throws([&] { (void)ChoosePlan(q, Scan("t"), o); }, "no matching index");
+    Throws([&] { (void)ChoosePlan(q, Scan("t"), o); }, "no feasible physical plan");
     o = {};
     o.outer = PhysicalOuter::Right;
     Throws([&] { (void)ChoosePlan(q, Scan("t"), o); }, "require a join");
@@ -618,7 +637,7 @@ void MemoryAndCost() {
         auto spec = Scan("three");
         spec.order_column = 0;
         spec.left.predicates = {{0, CompareOp::Equal, 99}}; // Sample estimate zero cannot prove no sort needed.
-        Throws([&] { (void)ChoosePlan(q, spec); }, "k >= 2");
+        Throws([&] { (void)ChoosePlan(q, spec); }, "no feasible physical plan");
         q.Close();
     }
     {
@@ -663,7 +682,7 @@ void MemoryAndCost() {
         QueryContext q(db, {32768, 4096});
         auto spec = Scan("too_many");
         spec.order_column = 0;
-        Throws([&] { (void)ChoosePlan(q, spec); }, "exact input exceeds initial run descriptor cap");
+        Throws([&] { (void)ChoosePlan(q, spec); }, "no feasible physical plan");
         // Once filtered, row count is uncertain: the sorter enforces its own descriptor cap.
         spec.left.predicates = {{0, CompareOp::Equal, 1}};
         auto p = ChoosePlan(q, spec);
@@ -675,8 +694,7 @@ void MemoryAndCost() {
         PlanOptions o;
         o.join = JoinChoice::GHJ;
         auto p = ChoosePlan(q, Join("three", "three"), o);
-        VDB_CHECK(p.resources.max_temp_pages == 1);
-        VDB_CHECK(Explain(p).find("max_temp_pages=1") != std::string::npos);
+        VDB_CHECK(p.root->Context().Resources().max_temp_pages == 1);
         Throws([&] { p.root->Init(); }, "temporary");
         p.root->Close();
         q.Close();
@@ -735,10 +753,9 @@ void PlanStructure() {
         VDB_CHECK(p.plan.kind == PlanKind::SortAggregate && p.plan.children.size() == 1);
         VDB_CHECK(p.plan.children[0].kind == PlanKind::SeqScan);
         VDB_CHECK(p.plan.NeedsInternalSort() && !Find(p.plan, PlanKind::ExternalSort));
-        VDB_CHECK(p.plan.memory_bytes == bytes && p.elided_order_column == 0);
+        VDB_CHECK(p.plan.memory_bytes == bytes);
         VDB_CHECK(explanation.find("internal_sort=yes") != std::string::npos);
         VDB_CHECK(explanation.find("ExternalSort") == std::string::npos);
-        VDB_CHECK(explanation.find("Final Sort eliminated") != std::string::npos);
         auto* aggregate = dynamic_cast<SortAggregate*>(p.root.get());
         VDB_CHECK(aggregate && aggregate->Memory().max_bytes == bytes);
         const size_t sort_bytes = bytes - aggregate->Memory().combine_bytes;
@@ -815,9 +832,8 @@ void PlanStructure() {
     VDB_CHECK(!Find(p.plan, PlanKind::ExternalSort));
     Near(aggregate->local_cost.pages, 0);
     Near(aggregate->local_cost.cpu, aggregate->children[0].rows);
-    VDB_CHECK(!p.plan.ordering.ordered && p.elided_order_column == 0);
+    VDB_CHECK(!p.plan.ordering.ordered);
     VDB_CHECK(Explain(p).find("internal_sort=no") != std::string::npos);
-    VDB_CHECK(Explain(p).find("before final projection") != std::string::npos);
     VDB_CHECK(Run(q, p).size() == 10);
     VDB_CHECK(q.Temps().Metrics().allocated_temp_pages == 0);
 }
@@ -874,10 +890,11 @@ void PipelineAndExplain() {
         VDB_CHECK(Find(join->children[0], PlanKind::Filter) && Find(join->children[1], PlanKind::Filter));
         example = Explain(p);
         for (const auto& text : {"Projection", "ExternalSort", "HashAggregate", "GHJ", "SeqScan", "employees", "departments",
-                "estimated_rows=", "input_rows=", "schema=[", "local_cost=", "subtree_cost=", "order=", "M=65536", "M=32768",
-                "M=24576", "C_sort=", "k=", "p=", "Dghj=", "build_capacities=", "group_capacity=", "F=8", "max_temp_pages=4096",
-                "sampled", "uncertain", "runtime BNLJ", "per heavyweight operator", "not runtime measurements"})
+                "rows=", "cost=", "local=", "pages=", "cpu=", "order=asc(1)", "M=65536", "M=32768",
+                "M=24576", "sampled", "Estimated cost"})
             VDB_CHECK(example.find(text) != std::string::npos);
+        VDB_CHECK(std::count(example.begin(), example.end(), '\n') == 9);
+        VDB_CHECK(example.find("rejected") == std::string::npos);
         VDB_CHECK(Run(q, p) == reference);
     }
     db.CreateIndex("employees", 0);
@@ -902,7 +919,7 @@ void PipelineAndExplain() {
 int main(int argc, char** argv) {
     const std::vector<std::pair<std::string, std::function<void()>>> cases{
         {"statistics", Statistics}, {"selectivity", Selectivity}, {"scans", ScanChoices},
-        {"ordering", OrderAndProjection}, {"joins", JoinChoices}, {"replay_costs", ReplayCosts},
+        {"ordering", OrderAndProjection}, {"feasible_alternatives", FeasibleAlternatives}, {"joins", JoinChoices}, {"replay_costs", ReplayCosts},
         {"forced_joins", ForcedJoins}, {"grace_fallback", GraceFallback}, {"aggregates", AggregateChoices}, {"validation", GlobalAndValidation},
         {"memory_costs", MemoryAndCost}, {"plan_structure", PlanStructure}, {"pipeline_explain", PipelineAndExplain}};
     size_t passed = 0;

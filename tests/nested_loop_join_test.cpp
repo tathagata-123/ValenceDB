@@ -674,7 +674,8 @@ void TempInputsAndFailure() {
         join.Init(); Tuple row({}); VDB_CHECK(join.Next(row));
         for (const auto& frame : db.Buffer().InspectFrames())
             if (frame.page && frame.page->file == FileKind::Temporary) db.Buffer().Invalidate(*frame.page);
-        db.Disk().FailNextIo(FailNext::Read);
+        db.Disk().Flush(FileKind::Temporary);
+        std::filesystem::resize_file(files.temp, 0);
         Throws([&] { while (join.Next(row)) {} });
         VDB_CHECK(!join.Exhausted());
         Throws([&] { q.FinishQuery(join); }, "EOF");

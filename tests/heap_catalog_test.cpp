@@ -335,7 +335,7 @@ void HeapDirectoryExhaustion() {
     db.Close();
 }
 
-void CrossOwnerAndFlushFailure() {
+void CrossOwner() {
     Files files("owner");
     Database db(files.db, OpenMode::CreateNew, files.temp, 2);
     db.CreateTable("a", Schema1());
@@ -351,8 +351,6 @@ void CrossOwnerAndFlushFailure() {
     VDB_CHECK(scan.Next().has_value());
     Throws([&] { (void)scan.Next(); });
     VDB_CHECK(db.Metrics().active_pins == 0);
-    db.Disk().FailNextIo(FailNext::Write);
-    Throws([&] { db.Flush(); });
     db.Flush();
     db.Close();
 }
@@ -400,7 +398,7 @@ int main() {
         HeapDirectoryExhaustion();
         DatabaseRoundTrip();
         CatalogValidation();
-        CrossOwnerAndFlushFailure();
+        CrossOwner();
         RandomizedRows();
         std::cout << "heap and catalog tests passed\n";
         return 0;

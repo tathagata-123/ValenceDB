@@ -66,11 +66,6 @@ struct PhysicalPlan {
 struct OptimizedPlan {
     PhysicalPlan plan;
     std::unique_ptr<Executor> root; // Context must outlive this owning tree.
-    QueryResources resources;
-    size_t buffer_frames;
-    std::vector<std::string> rejected;
-    PlanOptions options; // Explain forcing once, rather than storing prose on every candidate.
-    std::optional<size_t> elided_order_column; // ORDER BY position before final projection.
 };
 OptimizedPlan ChoosePlan(QueryContext&, const QuerySpec&, const PlanOptions& = {});
 std::string Explain(const OptimizedPlan&);

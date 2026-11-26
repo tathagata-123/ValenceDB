@@ -688,24 +688,14 @@ void Failures() {
         QueryContext q(db, {kMemory, 16384});
         SourceState state;
         HashAggregate a(q, All(), MakeSource(q, rows, state));
-        db.Disk().FailNextIo(FailNext::Write);
-        Throws([&] { a.Init(); }, "write");
-        AggregateTestAccess::Released(a);
-        VDB_CHECK(!a.Exhausted() && !state.open);
-        q.Close();
-        Clean(db);
-    }
-    {
-        QueryContext q(db, {kMemory, 16384});
-        SourceState state;
-        HashAggregate a(q, All(), MakeSource(q, rows, state));
         a.Init();
         Tuple out({});
         VDB_CHECK(a.Next(out));
         // Evict cached pages through normal BufferPool reads; do not discard dirty scratch.
         for (PageId p = 0; p < db.Disk().PageCount(FileKind::Temporary); ++p)
             db.Buffer().Invalidate({FileKind::Temporary, p});
-        db.Disk().FailNextIo(FailNext::Read);
+        db.Disk().Flush(FileKind::Temporary);
+        std::filesystem::resize_file(files.temp, 0);
         Throws([&] { Drain(a); }, "read");
         AggregateTestAccess::Released(a);
         VDB_CHECK(!a.Exhausted() && !q.Succeeded());

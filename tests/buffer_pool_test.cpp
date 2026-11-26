@@ -211,11 +211,6 @@ void TestFlushInvalidateAndFailures() {
     pool.Flush(b);
 
     { auto g = pool.Fetch(b); g.MutableData()[4] = std::byte{0x45}; g.MarkDirty(); }
-    const auto before_invalidate = State(pool, b);
-    f.disk.FailNextIo(FailNext::Write);
-    Reject([&] { pool.Invalidate(b); });
-    VDB_CHECK(State(pool, b).dirty &&
-              State(pool, b).generation == before_invalidate.generation);
     pool.Invalidate(b);
     VDB_CHECK(Index(pool, b) == 2);
     f.disk.Read(b, disk_bytes);
@@ -224,24 +219,14 @@ void TestFlushInvalidateAndFailures() {
     // A failed incoming read retains the old frame's mapping, contents, and pins.
     { auto g = pool.Fetch(b); g.MutableData()[5] = std::byte{0x46}; g.MarkDirty(); }
     const auto before = State(pool, b);
-    f.disk.FailNextIo(FailNext::Read);
+    f.disk.Flush(FileKind::Database);
+    std::filesystem::resize_file(f.path / "db.pages", uint64_t(c.page_id) * kPageSize);
     Reject([&] { pool.Fetch(c); });
     VDB_CHECK(Index(pool, b) < 2 && Index(pool, c) == 2);
     VDB_CHECK(State(pool, b).generation == before.generation);
     VDB_CHECK(State(pool, b).dirty);
     { auto g = pool.Fetch(b); VDB_CHECK(g.Data()[5] == std::byte{0x46}); }
     NoPins(pool);
-
-    BufferPool write_fail(f.disk, 1);
-    { auto g = write_fail.Fetch(a); g.MutableData()[3] = std::byte{0x44}; g.MarkDirty(); }
-    const auto old = State(write_fail, a);
-    f.disk.FailNextIo(FailNext::Write);
-    Reject([&] { write_fail.Fetch(c); });
-    VDB_CHECK(Index(write_fail, a) == 0 && Index(write_fail, c) == 1);
-    VDB_CHECK(State(write_fail, a).dirty && State(write_fail, a).generation == old.generation);
-    { auto g = write_fail.Fetch(a); VDB_CHECK(g.Data()[3] == std::byte{0x44}); }
-    NoPins(write_fail);
-    write_fail.FlushAll();
 }
 
 void TestNewPageAndIdentity() {

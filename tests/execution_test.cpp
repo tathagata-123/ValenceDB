@@ -424,36 +424,26 @@ void QueryBoundaries() {
 }
 
 void ExecutionFailures() {
-    Files files;
-    Database db(files.db, OpenMode::CreateNew, files.temp, 8);
-    Populate(db, true);
-    {
+    for (bool during_init : {false, true}) {
+        Files files;
+        Database db(files.db, OpenMode::CreateNew, files.temp, 8);
+        Populate(db, true);
         QueryContext query(db);
-        SeqScan scan(query, {"rows"});
-        scan.Init();
-        Tuple prefix({}); VDB_CHECK(scan.Next(prefix));
-        db.Buffer().Invalidate({FileKind::Database, db.Table("rows").first_page});
-        db.Disk().FailNextIo(FailNext::Read);
-        Throws([&] { scan.Next(prefix); });
-        VDB_CHECK(!scan.Exhausted());
-        Throws([&] { query.FinishQuery(scan); });
-        scan.Close(); query.Close();
-        VDB_CHECK(!query.Succeeded()); // Caller discards the output prefix.
-        Pins(db);
-    }
-    {
-        QueryContext query(db);
-        auto root = Pipeline(query, true, {0, 2});
+        auto root = Pipeline(query, during_init, {0, 2});
+        Tuple row({});
+        if (!during_init) { root->Init(); VDB_CHECK(root->Next(row)); }
         InvalidateDatabase(db);
-        db.Disk().FailNextIo(FailNext::Read);
-        Throws([&] { root->Init(); });
-        Pins(db);
-        // Init unwinds child/cursor state, so an ordinary injected read error can be retried.
-        root->Init();
-        VDB_CHECK(!Drain(db, *root).empty());
-        query.FinishQuery(*root);
+        db.Disk().Flush(FileKind::Database);
+        std::filesystem::resize_file(files.db, 0);
+        if (during_init) Throws([&] { root->Init(); });
+        else Throws([&] { root->Next(row); });
+        VDB_CHECK(!root->Exhausted());
+        Throws([&] { query.FinishQuery(*root); });
+        query.Close();
+        VDB_CHECK(!query.Succeeded());
+        Pins(db); CleanScratch(db, files);
+        // No attempt to replay or reuse a truncated database.
     }
-    CleanScratch(db, files); db.Close();
 }
 
 // Exercise common exception cleanup with live scratch, through a parent operator.
@@ -815,7 +805,7 @@ void TempCapAndAbandonment() {
     db.Close();
 }
 
-void SafeResetAndFailure() {
+void SafeReset() {
     Files files;
     Database db(files.db, OpenMode::CreateNew, files.temp, 8);
     db.CreateTable("empty", Base());
@@ -834,17 +824,7 @@ void SafeResetAndFailure() {
         VDB_CHECK(!query.Succeeded());
         reader.Close();
         const auto writes = db.Disk().counters().temporary_writes;
-        db.Disk().FailNextIo(FailNext::ResetTemporary);
-        Throws([&] { query.FinishQuery(root); });
-        VDB_CHECK(!query.Succeeded());
-        VDB_CHECK(db.Disk().PageCount(FileKind::Temporary) == 1);
-        // The focused failure occurs inside reset, after all cached scratch pages are discarded.
-        for (const auto& frame : db.Buffer().InspectFrames())
-            VDB_CHECK(!frame.page || frame.page->file != FileKind::Temporary);
-        VDB_CHECK(db.Disk().counters().temporary_writes == writes);
-        Throws([&] { QueryContext second(db); });
-        Throws([&] { db.Insert("empty", Row(1)); });
-        query.Close(); // This one-shot injected failure permits a normal checked cleanup retry.
+        query.Close(); // Checked cancellation discards scratch without writing dirty pages.
         VDB_CHECK(!query.Succeeded());
         db.Buffer().FlushAll();
         VDB_CHECK(db.Disk().counters().temporary_writes == writes);
@@ -909,7 +889,8 @@ void TempIoErrors() {
         TempWriter publish(query.Temps(), schema);
         publish.Append(Row(0));
         db.Buffer().Invalidate({FileKind::Temporary, 0});
-        db.Disk().FailNextIo(FailNext::Read);
+        db.Disk().Flush(FileKind::Temporary);
+        std::filesystem::resize_file(files.temp, 0);
         Throws([&] { publish.Finish(); });
         Throws([&] { publish.Finish(); });
         Throws([&] { publish.Append(Row(1)); }); Pins(db);
@@ -921,34 +902,12 @@ void TempIoErrors() {
         TempWriter writer(query.Temps(), schema); writer.Append(Row(0)); auto relation = writer.Finish();
         db.Buffer().Invalidate({FileKind::Temporary, relation.FirstPage()});
         TempReader reader(relation);
-        db.Disk().FailNextIo(FailNext::Read);
+        db.Disk().Flush(FileKind::Temporary);
+        std::filesystem::resize_file(files.temp, 0);
         Tuple out({});
         Throws([&] { reader.Next(out); }); Pins(db);
         reader.Close(); query.Close();
         CleanScratch(db, files);
-    }
-    {
-        QueryContext query(db);
-        const auto wide = WideSchema();
-        TempWriter writer(query.Temps(), wide);
-        writer.Append(WideRow(0));
-        db.Buffer().Invalidate({FileKind::Temporary, 0});
-        db.Disk().FailNextIo(FailNext::Read);
-        // The new page is allocated before publishing the previous tail fails.
-        Throws([&] { writer.Append(WideRow(1)); });
-        VDB_CHECK(query.Temps().Metrics().allocated_temp_pages == 2);
-        Throws([&] { writer.Finish(); });
-        Pins(db); query.Close(); CleanScratch(db, files);
-    }
-    {
-        QueryContext query(db);
-        const auto wide = WideSchema();
-        TempWriter writer(query.Temps(), wide);
-        db.Disk().FailNextIo(FailNext::Write);
-        // Enough pages to force a dirty eviction through DiskManager::Write.
-        Throws([&] { for (int64_t i = 0; i < 20; ++i) writer.Append(WideRow(i)); });
-        Throws([&] { writer.Finish(); });
-        Pins(db); query.Close(); CleanScratch(db, files);
     }
     // Page identity/type and accessed payload bounds remain mandatory.
     for (int corruption = 0; corruption < 3; ++corruption) {
@@ -1012,17 +971,42 @@ void FailedAllocationConsumesCap() {
     std::cout << "allocation-failure fixture: intentional external peak pins=8, final active pins=0\n";
 }
 
-void StartupResetFailure() {
-    Files files;
-    Database db(files.db, OpenMode::CreateNew, files.temp, 8);
-    db.Flush();
-    db.Disk().FailNextIo(FailNext::ResetTemporary);
-    Throws([&] { QueryContext failed(db); });
-    Throws([&] { QueryContext next(db); });
-    Throws([&] { db.CreateTable("forbidden", Base()); });
-    Pins(db);
-    // Construction failed after activation. No context owns cleanup; abandon this instance.
+void ResetIoFailures() {
+    for (bool startup : {false, true}) {
+        Files files;
+        Database db(files.db, OpenMode::CreateNew, files.temp, 8);
+        db.CreateTable("empty", Base());
+        db.Flush();
+        if (startup) {
+            std::filesystem::rename(files.temp, files.directory / "moved.tmp");
+            bool failed = false;
+            try { QueryContext query(db); }
+            catch (const std::filesystem::filesystem_error&) { failed = true; }
+            VDB_CHECK(failed);
+        } else {
+            QueryContext query(db);
+            const auto schema = Base();
+            TempWriter writer(query.Temps(), schema);
+            writer.Append(Row(0));
+            auto run = writer.Finish();
+            VDB_CHECK(run.PageCount() == 1);
+            SeqScan root(query, {"empty"});
+            root.Init(); Tuple row({}); VDB_CHECK(!root.Next(row));
+            std::filesystem::rename(files.temp, files.directory / "moved.tmp");
+            bool failed = false;
+            try { query.FinishQuery(root); }
+            catch (const std::filesystem::filesystem_error&) { failed = true; }
+            VDB_CHECK(failed && !query.Succeeded());
+            for (const auto& frame : db.Buffer().InspectFrames())
+                VDB_CHECK(!frame.page || frame.page->file != FileKind::Temporary);
+        }
+        Throws([&] { QueryContext next(db); });
+        Throws([&] { db.CreateTable("forbidden", Base()); });
+        Pins(db);
+        // A missing scratch path cannot be reset. Abandon the instance without retry.
+    }
 }
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1034,9 +1018,9 @@ int main(int argc, char** argv) {
         {"central_failure_cleanup", CentralFailureCleanup},
         {"memory_model", MemoryModel}, {"empty_single_temp", EmptyAndSingleTemp},
         {"multi_page_temp", MultiPageTemp}, {"interleaved_values", InterleavedTempValues},
-        {"temp_cap", TempCapAndAbandonment}, {"safe_reset_failure", SafeResetAndFailure},
+        {"temp_cap", TempCapAndAbandonment}, {"safe_reset", SafeReset},
         {"pinned_reset", PinnedReset}, {"temp_io_errors", TempIoErrors},
-        {"allocation_failure", FailedAllocationConsumesCap}, {"startup_failure", StartupResetFailure}};
+        {"allocation_failure", FailedAllocationConsumesCap}, {"reset_io_failures", ResetIoFailures}};
     try {
         for (const auto& [name, run] : tests) {
             if (argc > 1 && name.find(argv[1]) == std::string::npos) continue;

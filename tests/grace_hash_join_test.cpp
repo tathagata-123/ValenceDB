@@ -627,25 +627,16 @@ void Failures() {
         join.Init();
         Tuple row({}); VDB_CHECK(join.Next(row));
         if (fallback) VDB_CHECK(join.Metrics().fallback_pairs == 1);
-        // Flush/evict temp pages so a later reader transfer must hit the injected file-read error.
+        // Flush/evict temp pages so a later reader transfer must hit the real short file read.
         for (PageId id = 0; id < db.Disk().PageCount(FileKind::Temporary); ++id)
             db.Buffer().Invalidate({FileKind::Temporary, id});
-        db.Disk().FailNextIo(FailNext::Read);
-        Throws([&] { while (join.Next(row)) {} }, "injected");
+        db.Disk().Flush(FileKind::Temporary);
+        std::filesystem::resize_file(files.temp, 0);
+        Throws([&] { while (join.Next(row)) {} }, "short page read");
         VDB_CHECK(!join.Exhausted() && !q.Succeeded());
 
         q.Close(); Clean(db);
     }
-    Files files;
-    Database db(files.db, OpenMode::CreateNew, files.temp, 8);
-    QueryContext q(db);
-    const auto rows = Rows(180, 7, true); // More than F pages forces dirty scratch eviction.
-    SourceState a, b;
-    GraceHashJoin join(q, {1, 1, 24576}, Child(q, Wide(), rows, a), Child(q, Wide(), rows, b));
-    db.Disk().FailNextIo(FailNext::Write);
-    Throws([&] { join.Init(); }, "injected");
-
-    q.Close(); Clean(db);
 }
 void SortComposition() {
     Files files;

@@ -104,7 +104,6 @@ void WriteRID(std::span<std::byte> bytes, size_t offset, RID rid) {
 
 RID ReadRID(std::span<const std::byte> bytes, size_t offset) {
     CheckBounds(bytes.size(), offset, kSerializedRIDSize);
-    if (ReadU16(bytes, offset + 6) != 0) throw DbError("RID reserved bytes are nonzero");
     return {ReadU32(bytes, offset), ReadU16(bytes, offset + 4)};
 }
 
@@ -127,7 +126,6 @@ void ValidatePageHeader(std::span<const std::byte> bytes, PageType expected_type
     if (!KnownPageType(type) || type == 0) throw DbError("invalid page type");
     if (ReadU16(bytes, 6) != kPageFormatVersion) throw DbError("page format mismatch");
     if (ReadU32(bytes, 8) == kInvalidPageId) throw DbError("invalid page ID in header");
-    if (ReadU32(bytes, 12) != 0) throw DbError("page reserved field is nonzero");
     if (expected_type != PageType::Unknown && type != static_cast<uint16_t>(expected_type))
         throw DbError("page type mismatch");
     if (expected_page_id != kInvalidPageId && ReadU32(bytes, 8) != expected_page_id)

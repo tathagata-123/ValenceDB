@@ -1,5 +1,5 @@
 // Standalone insertion-only V1 probe; build commands are in docs/benchmarks.md.
-// TSV output is separate from the schema-v2 query benchmark stream.
+// TSV output is separate from the JSONL query benchmark stream.
 #include "bplus_validator.hpp"
 
 #include <algorithm>

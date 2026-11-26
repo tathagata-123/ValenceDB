@@ -25,11 +25,6 @@ void WriteKey(PageBytes& page, size_t at, BPlusKey entry) {
     WriteRID(page, at + 8, entry.rid);
 }
 
-void CheckReserved(const PageBytes& page) {
-    if (ReadU16(page, 18) != 0 || ReadU64(page, 24) != 0)
-        throw DbError("nonzero B+ tree reserved header bytes");
-}
-
 void CheckMeta(PageId id, BPlusMeta meta) {
     if (id == kInvalidPageId || meta.root == kInvalidPageId || meta.root == id ||
         meta.height == 0 || meta.height > kBPlusMaxHeight ||
@@ -88,7 +83,6 @@ void BPlusLeafPage::Write(PageBytes& page, std::span<const BPlusKey> entries, ui
 
 void BPlusLeafPage::Validate(const PageBytes& page, PageId id, uint16_t maximum) {
     ValidatePageHeader(page, PageType::BPlusLeaf, id);
-    CheckReserved(page);
     const auto count = Count(page);
     if (maximum < 2 || maximum > kBPlusLeafMax || count > maximum || Next(page) == id)
         throw DbError("invalid B+ leaf count or link");
@@ -135,7 +129,6 @@ void BPlusInternalPage::Write(PageBytes& page, std::span<const PageId> children,
 
 void BPlusInternalPage::Validate(const PageBytes& page, PageId id, uint16_t maximum) {
     ValidatePageHeader(page, PageType::BPlusInternal, id);
-    CheckReserved(page);
     const auto count = ChildCount(page);
     if (maximum < 3 || maximum > kBPlusInternalMax || count > maximum)
         throw DbError("B+ internal count exceeds configured capacity");

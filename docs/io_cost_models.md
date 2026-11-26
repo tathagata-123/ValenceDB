@@ -45,7 +45,7 @@ Empty relations allocate no pages. Releasing a relation drops RAM handles withou
 
 A TempReader stages each visited page with one BufferPool Fetch; decoding multiple tuples and observing EOF on that page add no logical page transfers. TempWriter publishes each page through one Fetch and marks it dirty. Its separate NewPage allocation is not another Fetch. A logical transfer can hit the cache with no file read; a dirty frame may later be written by replacement. Tests assert these boundaries without claiming that tuple-at-a-time heap scans perform only one Fetch per page.
 
-Successful teardown closes executors and handles, rejects temporary pins, discards all temporary cache mappings (including dirty frames), and only then checks scratch reset. A reset error means FinishQuery failed and no success is recorded; the Database remains query-active. Genuine structural/reset failure can require abandoning the instance. The focused one-shot reset test allows ordinary checked cancellation afterward; this is not a recovery guarantee.
+Successful teardown closes executors and handles, rejects temporary pins, discards all temporary cache mappings (including dirty frames), and only then checks scratch reset. A reset error means FinishQuery failed and no success is recorded; the Database remains query-active. Genuine structural/reset failure can require abandoning the instance. Real missing-path reset tests verify error propagation and instance abandonment; there is no one-shot reset/retry hook.
 
 ## Algorithmic work and optimizer costs
 
@@ -63,7 +63,7 @@ The optimizer's `ModeledCost` uses logical pages plus `0.0001 * cpu`, not cache 
 | HashAggregate, spill | Child once + partial writes + partial TempScan reads + reduced-budget partial ExternalSort work + combine CPU |
 | SortAggregate | Actual child once + group CPU + internal reduced-budget sort work only when input is unordered |
 
-SortAggregate local cost includes internal sorting; there is no synthetic sort child. The shared pure sort estimator excludes its input path. Hash partial generation and TempScan reads are charged by the aggregate separately from partial-sort work. Derived capacities and replay counts are formatted on demand, and the planner no longer accumulates diagnostic temporary-extent totals. Runtime limits use physical scratch extent; see the allocation counter boundary above.
+SortAggregate local cost includes internal sorting; there is no synthetic sort child. The shared pure sort estimator excludes its input path. Hash partial generation and TempScan reads are charged by the aggregate separately from partial-sort work. Capacities and replay counts are local costing calculations; compact EXPLAIN displays the selected estimates without recomputing those worksheets. The planner accumulates no diagnostic temporary-extent totals. Runtime limits use physical scratch extent; see the allocation counter boundary above.
 
 An indexed/filter/project inner is charged at its selected subtree execution cost, not replaced with raw table pages. Adding all displayed children once to an NLJ/BNLJ subtree would misrepresent replay. A final projection does not add page work. [optimizer.md](optimizer.md) gives exact estimates and feasibility formulas.
 

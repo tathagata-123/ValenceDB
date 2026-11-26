@@ -27,7 +27,7 @@ context.FinishQuery(*chosen.root);
 
 Automatic projection pruning is omitted: extra payload survives unless the caller supplies a ProjectionPlan. `ProjectedSchema` and `ProjectedOrdering` are the shared execution helpers, so the first surviving occurrence of the ordered column is remapped; removing it loses the ordering proof. Filter preserves order; joins and HashAggregate are conservatively unordered. SortAggregate exposes ascending output column 0. Sorting nullable global SUM/MIN/MAX or DOUBLE AVG is rejected; there is no NULL comparator. COUNT(*) needs no measure. Global aggregation uses the existing single-state HashAggregate path, without group table or sort.
 
-`OptimizedPlan` owns one `unique_ptr<Executor> root`, its inspectable `PhysicalPlan` descriptor, resource snapshot, frame count, deduplicated rejection reasons, and the requested options. It also records an eliminated ORDER BY column before final projection, since that projection may remove the key. Database outlives QueryContext, which outlives that root. Descriptors are inspection results, not a separate mutable executable-plan API. Candidates are small value trees; only the winner constructs executor objects, and planning never calls Init. SortAggregate retains its actual input as its child. `NeedsInternalSort()` derives the internal-sort requirement from the group key and that child's ordering; the executor constructs its sorter once with the reduced allowance. `Build()` recursively constructs each child and switches on the operator kind, without skipping nodes.
+`OptimizedPlan` owns one `unique_ptr<Executor> root` and its inspectable `PhysicalPlan` descriptor. It carries no resource/options snapshot, rejection history or separate sort-elision metadata. Database outlives QueryContext, which outlives that root. Descriptors are inspection results, not a separate mutable executable-plan API. Candidates are small value trees; only the winner constructs executor objects, and planning never calls Init. SortAggregate retains its actual input as its child. `NeedsInternalSort()` derives the internal-sort requirement from the group key and that child's ordering; the executor constructs its sorter once with the reduced allowance. `Build()` recursively constructs each child and switches on the operator kind, without skipping nodes.
 
 Each `PhysicalPlan` is one tagged value with schema/order, estimated rows, exactness,
 conservative row bound, NDVs, local/subtree cost, real children, operator configuration,
@@ -48,7 +48,7 @@ empty: NDV=0, sample empty, min/max absent
 
 Even a complete small sample is labeled approximate NDV. Exact min/max covers all live rows, including INT64_MIN/MAX. `Database::Statistics(name)` returns a nullable pointer to `TableStatistics { analyzed_rows, stale, columns }`. Absence means unanalyzed. Do not retain its column references across another Analyze. Insert, successful Delete, and CreateIndex mark the affected analyzed table stale. Re-Analyze replaces the snapshot and clears staleness. Analyze follows Database mutation exclusion during an active query.
 
-Statistics are **in-memory only** and disappear on reopen. Reopened planning uses heuristics until explicit Analyze. Row count, heap page count, index existence/column and index height remain exact, maintained catalog/index metadata; planning never scans data to discover them. Deletes can leave heap pages allocated, so packed estimated output pages and exact physical heap pages are distinct quantities. EXPLAIN derives packed pages from schema/rows; SeqScan local page cost preserves the exact heap-page charge.
+Statistics are **in-memory only** and disappear on reopen. Reopened planning uses heuristics until explicit Analyze. Row count, heap page count, index existence/column and index height remain exact, maintained catalog/index metadata; planning never scans data to discover them. Deletes can leave heap pages allocated, so packed estimated output pages and exact physical heap pages are distinct quantities. Costing derives packed temporary pages from schema/rows; SeqScan local page cost preserves the exact heap-page charge.
 
 Statistics may influence plan choice but never query correctness. Stale samples remain usable and are labeled `stale-sampled`; they never remove a predicate, substitute an empty executor, change index bounds, or choose a different comparison. Runtime predicates are retained even when estimated selectivity is zero. The stale-statistics test inserts a key outside the last analyzed range: the zero-row estimate still returns the row, agreeing with fresh stats and forced SeqScan.
 
@@ -56,7 +56,7 @@ Statistics may influence plan choice but never query correctness. Stale samples 
 
 `EstimateSelectivity` uses `1/NDV` for in-range equality and zero for a value outside sampled-snapshot exact min/max. Range estimates use an inclusive integer domain, `(max-min+1)`, with endpoint comparisons performed in INT64 and unsigned differences before floating conversion. This avoids signed overflow, division by zero, and cancellation for adjacent values near signed extremes. Clamp every fraction to [0,1]. Without useful min/max, equality uses 0.1 and inequalities use 1/3. Missing NDV uses sqrt(current rows), bounded to [1,rows]; empty is zero.
 
-Filter conjunction estimates multiply the individual fractions. This assumes independence, including a deliberately crude treatment of overlapping predicates on one column. Index bounds use the minimum individual bound fraction; filter-prefix estimates are capped by access rows so the bounds are not applied twice. All filters still execute. Join rows use `left_rows*right_rows/max(1,left_NDV,right_NDV)`; group count uses the selected key NDV capped by estimated input rows. These assumptions can be wrong, especially for skew or correlated columns. Scan nodes identify their statistics source as fresh sampled, stale-sampled, or heuristic. Row exactness and conservative bounds are shown independently at every node.
+Filter conjunction estimates multiply the individual fractions. This assumes independence, including a deliberately crude treatment of overlapping predicates on one column. Index bounds use the minimum individual bound fraction; filter-prefix estimates are capped by access rows so the bounds are not applied twice. All filters still execute. Join rows use `left_rows*right_rows/max(1,left_NDV,right_NDV)`; group count uses the selected key NDV capped by estimated input rows. These assumptions can be wrong, especially for skew or correlated columns. Scan nodes identify their statistics source as fresh sampled, stale-sampled, or heuristic. Row exactness and conservative bounds remain in the descriptor for feasibility; EXPLAIN shows the estimated row count.
 
 Costs/cardinalities use `long double`, including multiplication before any narrowing. No row-count product is computed in uint64_t. Exact raw counts also supply conservative row upper bounds (join Cartesian product, filters do not reduce the bound). Sampled selectivity never serves as a proof of memory feasibility.
 
@@ -79,7 +79,7 @@ NLJ  = outer_path + outer_rows * inner_path + comparisons
 BNLJ = outer_path + ceil(outer_rows/C_block) * inner_path + comparisons
 ```
 
-Join local cost excludes replayed child work: local page work is zero for nested loops; multiplicity appears in subtree cost and the derived EXPLAIN values `inner_executions`/`inner_replay_cost`. These values are no longer stored on the node. An empty outer executes the inner zero times. Do not sum displayed children once to reconstruct a nested-loop subtree.
+Join local cost excludes replayed child work: local page work is zero for nested loops; multiplicity appears in subtree cost. Replays are computed locally during costing, with no extra metadata or EXPLAIN worksheet. An empty outer executes the inner zero times. Do not sum displayed children once to reconstruct a nested-loop subtree.
 
 For temporary data, `N(schema,n)=ceil(n/floor(4064/(max_encoded_bytes+4)))`. This packed worst-width model ignores per-run/partition fragmentation and singleton carry savings. The planner does not retain a cumulative temporary-extent estimate. Runtime TempStore enforces the append-only allocation cap; releasing runs does not reclaim extent. Allocation initialization and cache effects are omitted.
 
@@ -97,7 +97,7 @@ The tests show a 2,000-row/8-page table choosing a one-tuple IndexScan at 3 page
 
 ## Shared local memory calculations
 
-Planner and executors call the **same** small Compute helpers in their existing operator modules. Each heavyweight plan stores only the resolved allowance used in costing. `Build()` passes that exact byte allowance to the executor, including overrides; layouts are recalculated locally. EXPLAIN uses the same helpers against the selected plan and its resource snapshot. No memory-grant or query-admission system is introduced. Checked reserve arithmetic, vector/container representability, and minimum capacities remain in those helpers. Here P=4096 and T is RowMemoryCharge.
+Planner and executors call the **same** small Compute helpers in their existing operator modules. Each heavyweight plan stores only the resolved allowance used in costing. `Build()` passes that exact byte allowance to the executor, including overrides; layouts are recalculated locally. EXPLAIN does not recompute capacities or validate resources. QueryContext validates query limits once; the shared helpers check the selected local memory allowance. No memory-grant or query-admission system is introduced. Checked reserve arithmetic, vector/container representability, and minimum capacities remain in those helpers. Here P=4096 and T is RowMemoryCharge.
 
 | Operator | Derivation |
 |---|---|
@@ -107,7 +107,7 @@ Planner and executors call the **same** small Compute helpers in their existing 
 | HashAggregate | `Tmax=max(Tinput,Toutput,Tpartial)`; `S=2P+3*Tmax+1024`; grouped capacity=`(M-S)/192 >=1` |
 | Aggregate combine | `Ccombine=3*Tmax+1024`; global/ordered requires M>=Ccombine; hash internal Msort=`M-Ccombine-(P+128)`; unordered SortAggregate Msort=`M-Ccombine` |
 
-GHJ local pages add two packed input volumes: partition writes and partition reads. Original inputs are paid by child costs exactly once. Skew is unknown; EXPLAIN names the runtime BNLJ overflow fallback. For 1,000 rows on both narrow sides at M=32768, GHJ wins at score 24.6, with p=5, Dghj=640, and build capacities 103/103. A separate forced GHJ test actually triggers one fallback pair without relabeling the plan.
+GHJ local pages add two packed input volumes: partition writes and partition reads. Original inputs are paid by child costs exactly once. Skew is unknown; the GHJ executor retains runtime BNLJ overflow fallback. For 1,000 rows on both narrow sides at M=32768, GHJ wins at score 24.6, with p=5, Dghj=640, and build capacities 103/103. A separate forced GHJ test actually triggers one fallback pair without relabeling the plan.
 
 For BNLJ at M=18200, S=14664, a 40-row narrow side has C=29 and two inner executions, while the five-row wide side has C=2 and three executions. Both mirrored query forms select the narrow outer, retaining logical output positions.
 
@@ -117,7 +117,7 @@ For BNLJ at M=18200, S=14664, a 40-row narrow side has C=29 and two inner execut
 
 Let r=ceil(estimated rows/C_sort). If r<=1, modeled temp work is zero. Otherwise let L be the number of repeated `r=ceil(r/k)` reductions until r<=k. ExternalSort local page work is `(2L+2)*N`: initial writes, L intermediate read/write levels, and final streamed reads. Child input is **not** charged again. There is no materialized final output. A 150-row wide forced SeqScan plan at M=32768 has C_sort=8, k=2, 19 initial runs, four materialized levels, local sort pages=300 and subtree pages=330.
 
-If exact upper bounds permit more than one run, k must be at least two even when samples predict a private run. An exact known input exceeding D initial descriptors is rejected during planning. For uncertain filtered/join/spill volume, EXPLAIN flags the finite descriptor risk and runtime retains the cap. Neither row estimates nor logical page costs guarantee successful execution within runtime caps.
+If exact upper bounds permit more than one run, k must be at least two even when samples predict a private run. An exact known input exceeding D initial descriptors is rejected during planning. For uncertain filtered/join/spill volume, runtime retains the finite descriptor cap. Neither row estimates nor logical page costs guarantee successful execution within runtime caps.
 
 Grouped HashAggregate compares estimated groups with capacity. Fit predicts no temp I/O. Spill conservatively models one partial per estimated raw input row: partial writes plus the TempScan read, ExternalSort **over partial states** using reduced Msort, and streaming combination. Local work adds `2*Npartial + sort_local`, not a second scan of raw input. Spill prediction is uncertain; HashAggregate handles actual spills irrespective of the estimate.
 
@@ -135,36 +135,33 @@ SortAggregate reuses proven ascending group-key order with streaming CPU only. O
 - `scan_ring`: `ScanRingChoice::{Auto,On,Off}`, applied to SeqScan. Auto enables the existing ring when exact heap pages exceed F/4; On/Off are passed to SeqScanPlan. It has no effect on IndexScan.
 - `sort_memory`, `join_memory`, `aggregate_memory`: positive optional numeric local overrides. Sort override controls final ORDER BY; aggregate internal sorts use the aggregate's reduced budget. Join override governs BNLJ/GHJ; NLJ has no work-memory reservation.
 
-Forced choices are honored or rejected with a reason, never silently substituted. Missing index, insufficient BNLJ/GHJ/hash/sort memory, outer without a join, GHJ plus outer, and forced grouped algorithms for global aggregation reject. With Auto join plus forced outer, only NLJ/BNLJ are eligible; GHJ has no physical outer setting. Supporting sorts remain permitted in forced plans. GHJ's own overflow fallback and HashAggregate's own spill remain their respective algorithms.
+Forced choices are honored or rejected, never silently substituted. Candidate memory/fan-in failures skip that candidate; if no complete plan remains, ChoosePlan throws `no feasible physical plan`. Invalid public options/shapes have direct validation errors. No rejection strings are retained, and native allocation errors are not swallowed as candidate failures. Missing index, insufficient BNLJ/GHJ/hash/sort memory, outer without a join, GHJ plus outer, and forced grouped algorithms for global aggregation reject. With Auto join plus forced outer, only NLJ/BNLJ are eligible; GHJ has no physical outer setting. Supporting sorts remain permitted in forced plans. GHJ's own overflow fallback and HashAggregate's own spill remain their respective algorithms.
 
 F is configured by Database's existing BufferPool constructor; M and max_temp_pages use the existing QueryContext QueryResources. Several live heavyweight operators each have their own M. They are algorithmic accounting allowances, **not a whole-query RSS cap**. The optimizer does not estimate cumulative temporary extent. Runtime cap errors propagate normally and invalidate the result prefix.
 
 ## EXPLAIN worked plan
 
-`Explain(chosen)` returns a multiline string with the operator hierarchy, schema, ordering, input/output row estimates, local/subtree score and local page/CPU components, scan statistics source, table/index/bounds/ring, requested forcing options, capacities, F, temporary limit and uncertainty. The formatter derives this text after selection; it does not consult current database state or initialize an executor. SortAggregate reports `internal_sort=yes/no` and its reduced sort budget without inventing a child node. Costs are predictions; runtime Metrics are untouched. Capacity detail includes BNLJ Touter/S/C_block/replays, GHJ p/D/build/fallback M, sorter T/S/D/R/C/k/runs/levels, and aggregate capacity/internal allowance. Rejected alternatives are deduplicated.
+`Explain(chosen)` returns a cost legend followed by one line per physical node.
+Each line shows the operator/configuration, estimated rows, subtree score and
+page/CPU components, local score, ordering, and resolved memory allowance when
+applicable. Scan nodes include the statistics source. SortAggregate reports
+`internal_sort=yes/no`, retaining its real input child; it does not invent a
+synthetic ExternalSort node. A missing final sort and the child's ordering show
+order reuse, even if the final projection subsequently drops that key.
 
-The `pipeline_explain` fixture runs filter→join→aggregate→order→projection against an independent reference. Its forced example, abbreviated from real output, is:
+The formatter only reads the selected descriptor. It never consults the current
+database, computes capacities, initializes executors, or changes runtime metrics.
+Resource worksheets, full schema dumps, forced-option echoes, uncertainty prose
+and rejected alternatives are omitted. Consult `Memory()` on the actual operator
+or the formulas above when studying capacities. M is per operator, not whole-query
+RSS; sampled row/cost estimates cannot guarantee that runtime caps will suffice.
 
-```text
-F=8, max_temp_pages=4096
-[forced join] GHJ
-[forced aggregate] HashAggregate
-Projection [2,0,1] rows=5 subtree_cost=6.0497 order=column 1
-  ExternalSort key=0 rows=5 local_cost=0.001161 subtree_cost=6.0497
-    M=24576 Tinput=216 S=9864 D=24 R=3072 C_sort=53 k=2
-    predicted private run, no temp pages
-    HashAggregate group=0 groups=5 predicted spill=no [uncertain]
-      M=32768 S=10296 group_capacity=117 internal_sort_budget=26440
-      input_rows=64 local_cost=0.0128 subtree_cost=6.0485 output unordered
-      GHJ keys=0,0 rows=64 local_cost=4.0252 subtree_cost=6.0357
-        M=65536 S=10008 p=12 Dghj=1536 build=204,204 fallback_M=64000
-        Filter column 1>20 rows=80
-          SeqScan table=employees rows=100 local_cost=1 scan_ring=off [fresh sampled]
-        Filter column 0<4 rows=4
-          SeqScan table=departments rows=5 local_cost=1 scan_ring=off [fresh sampled]
-```
-
-The actual result has four groups; the five-group prediction illustrates approximate join/group NDV. The high-NDV hash cost comparison is a prediction and includes a finite-descriptor risk at M=32768; the successful forced-spill equivalence test uses M=65536. A final sort is necessary because HashAggregate promises no order, even though this small sort is predicted private. The final projection remaps ordered group column 0 to output column 1. Equivalent automatic and forced index variants match the same reference bag.
+The `pipeline_explain` fixture runs filter → join → aggregate → sort → projection
+against an independent reference. Its exact EXPLAIN output is recorded in the
+[V1 verification report](v1_algorithm_first.md). The result has four groups;
+the estimated five groups illustrate approximate join/group NDV. The final
+projection remaps ordered group column 0 to output column 1. Equivalent automatic
+and forced index variants match the same reference bag.
 
 ## Limits
 

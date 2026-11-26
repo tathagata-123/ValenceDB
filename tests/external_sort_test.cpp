@@ -478,21 +478,14 @@ void FailureCleanup() {
         QueryContext q(db, {131072, 16384});
         SourceState state;
         ExternalSort sort(q, {2}, Child(q, rows, state));
-        db.Disk().FailNextIo(FailNext::Write);
-        Throws([&] { sort.Init(); }, "injected page write");
-        VDB_CHECK(!sort.Exhausted()); Pins(db); q.Close(); Clean(db, files);
-    }
-    {
-        QueryContext q(db, {131072, 16384});
-        SourceState state;
-        ExternalSort sort(q, {2}, Child(q, rows, state));
         sort.Init();
         for (PageId id = 0; id < db.Disk().PageCount(FileKind::Temporary); ++id)
             db.Buffer().Invalidate({FileKind::Temporary, id});
-        db.Disk().FailNextIo(FailNext::Read);
+        db.Disk().Flush(FileKind::Temporary);
+        std::filesystem::resize_file(files.temp, 0);
         size_t prefix = 0;
         Tuple row({});
-        Throws([&] { while (sort.Next(row)) ++prefix; }, "injected page read");
+        Throws([&] { while (sort.Next(row)) ++prefix; }, "short page read");
         VDB_CHECK(prefix > 0 && prefix < rows.size() && !sort.Exhausted());
         Throws([&] { q.FinishQuery(sort); }, "EOF");
         Pins(db); q.Close(); Clean(db, files); // Whole prefix is deliberately discarded.

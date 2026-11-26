@@ -14,7 +14,6 @@ void QueryResources::Validate() const {
         throw DbError("query memory and temporary page limits must be positive and representable");
 }
 size_t ResolveBudget(const QueryResources& resources, std::optional<size_t> local) {
-    resources.Validate();
     const size_t bytes = local.value_or(resources.work_memory_bytes);
     if (bytes == 0) throw DbError("operator memory must be positive");
     return bytes;
