@@ -211,9 +211,7 @@ void TestDisk() {
         Reject([&] { disk.Read({FileKind::Database, 2}, read); });
         Reject([&] { disk.Write({FileKind::Temporary, 2}, a); });
         disk.FailNextIo(FailNext::Read);
-        read.fill(std::byte{0x55});
         Reject([&] { disk.Read({FileKind::Database, 0}, read); });
-        VDB_CHECK(read[0] == std::byte{0x55});
         disk.Read({FileKind::Database, 0}, read);
         VDB_CHECK(read == a);
         disk.FailNextIo(FailNext::Write);
@@ -227,8 +225,6 @@ void TestDisk() {
         VDB_CHECK(disk.counters().temporary_reads == 1);
         VDB_CHECK(disk.counters().database_writes == 2);
         VDB_CHECK(disk.counters().temporary_writes == 1);
-        VDB_CHECK(disk.counters().failed_reads == 3);
-        VDB_CHECK(disk.counters().failed_writes == 2);
         disk.FlushAll();
         disk.Close();
         Reject([&] { disk.Read({FileKind::Database, 0}, read); });
@@ -258,12 +254,43 @@ void TestDisk() {
     Reject([&] { DiskManager(db, OpenMode::OpenExisting, db, OpenMode::OpenExisting); });
 }
 
+void TestPhysicalIoErrors() {
+    TestDirectory dir;
+    const auto db = dir.path / "db.pages";
+    const auto tmp = dir.path / "tmp.pages";
+    {
+        DiskManager disk(db, OpenMode::CreateNew, tmp, OpenMode::CreateNew);
+        disk.Allocate(FileKind::Database);
+        disk.Allocate(FileKind::Database);
+        disk.Close();
+    }
+    {
+        DiskManager disk(db, OpenMode::OpenExisting, tmp, OpenMode::OpenExisting);
+        // A real short transfer must throw, even though the page ID was allocated.
+        std::filesystem::resize_file(db, kPageSize + 17);
+        PageBytes bytes{};
+        Reject([&] { disk.Read({FileKind::Database, 1}, bytes); });
+        VDB_CHECK(disk.counters().database_reads == 0);
+        // Abandon the instance; failed-read output and retry are not guaranteed.
+    }
+    std::filesystem::resize_file(db, kPageSize);
+    {
+        DiskManager disk(db, OpenMode::OpenExisting, tmp, OpenMode::OpenExisting);
+        std::filesystem::rename(tmp, dir.path / "moved.pages");
+        bool failed = false;
+        try { disk.ResetTemporary(); }
+        catch (const std::filesystem::filesystem_error&) { failed = true; }
+        VDB_CHECK(failed); // Native filesystem errors propagate without translation.
+    }
+}
+
 int main() {
     try {
         TestSchema();
         TestTuple();
         TestPageCodec();
         TestDisk();
+        TestPhysicalIoErrors();
         std::cout << "storage primitives tests passed\n";
         return 0;
     } catch (const std::exception& error) {

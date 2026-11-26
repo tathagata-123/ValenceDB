@@ -73,8 +73,7 @@ std::vector<std::string> Database::TableNames() const {
 RID Database::Insert(const std::string& name, const Tuple& tuple) {
     CheckMutable();
     auto table = catalog_->Find(name);
-    // Validate the entire tuple before either heap or index mutation.
-    (void)EncodeTuple(table.schema, tuple);
+    // HeapFile encodes and validates the tuple before changing any page.
     const int64_t key = table.index_meta == kInvalidPageId ? 0 : tuple.value(table.index_col).as_int64();
     HeapFile heap(pool_, table);
     const RID rid = heap.Insert(tuple);
@@ -98,11 +97,8 @@ bool Database::Delete(const std::string& name, RID rid) {
     if (table.index_meta != kInvalidPageId)
         throw DbError("deletion from indexed tables is not supported in V1");
     HeapFile heap(pool_, table);
-    // Fetch validates the heap page owner before changing the heap.
-    const auto old = heap.Fetch(rid);
-    if (!old) return false;
-    if (table.live_rows == 0) throw DbError("table row count underflow");
-    if (!heap.Erase(rid)) throw DbError("live heap row disappeared during delete");
+    // Erase checks ownership and tombstones directly, without decoding the tuple.
+    if (!heap.Erase(rid)) return false;
     ++epoch_;
     catalog_->Save(table);
     StaleStatistics(name);

@@ -18,20 +18,18 @@ struct IoCounters {
     uint64_t temporary_reads = 0;
     uint64_t temporary_writes = 0;
     uint64_t temporary_allocations = 0;
-    uint64_t failed_reads = 0;
-    uint64_t failed_writes = 0;
 };
 
 class DiskManager {
 public:
     DiskManager(std::filesystem::path database_path, OpenMode database_mode,
                 std::filesystem::path temporary_path, OpenMode temporary_mode);
-    ~DiskManager() noexcept;
+    ~DiskManager() noexcept = default;
     DiskManager(const DiskManager&) = delete;
     DiskManager& operator=(const DiskManager&) = delete;
 
     PageId Allocate(FileKind kind);
-    void Read(PageRef page, PageBytes& out);
+    void Read(PageRef page, PageBytes& out); // On failure, out may be partially overwritten.
     void Write(PageRef page, const PageBytes& data);
     uint32_t PageCount(FileKind kind) const;
     void Flush(FileKind kind);
@@ -40,6 +38,7 @@ public:
     void ResetTemporary();
 
     const IoCounters& counters() const noexcept { return counters_; }
+    // Retained for executor/index error-propagation tests pending later V1 phases.
     void FailNextIo(FailNext operation) noexcept { fail_next_ = operation; }
 
 private:

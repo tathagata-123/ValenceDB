@@ -90,7 +90,7 @@ S = 2*4096 + 3*Tmax + 1024
 
 `QueryContext::FinishQuery` requires observed root EOF, closes the tree, and calls checked context cleanup. `TempStore::Reset` rejects open readers/writers, `DiscardTemporaryPages` checks pins and discards mappings, and only then does `DiskManager::ResetTemporary` truncate/reopen scratch. Success is recorded after all these steps succeed. Closed executor objects may still exist; their working handles must be gone.
 
-For cancellation, close the tree/handles then call `QueryContext::Close`; cancellation never records success. `Next()==false` means EOF, never error. Any execution error invalidates the whole emitted prefix. Unexpected structural I/O failure may leave heap/index state uncertain: propagate `DbError` and abandon the instance. There is no WAL, transaction rollback, poisoned-handle framework, or crash recovery.
+For cancellation, close the tree/handles then call `QueryContext::Close`; cancellation never records success. `Next()==false` means EOF, never error. Any execution error invalidates the whole emitted prefix. Unexpected structural I/O failure may leave heap/index state uncertain: propagate the error and abandon the instance (stream errors are `DbError`; filesystem operations may throw `std::filesystem::filesystem_error`). There is no WAL, transaction rollback, poisoned-handle framework, or crash recovery.
 
 ## Metrics, benchmarks, and reading route
 

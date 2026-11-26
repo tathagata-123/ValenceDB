@@ -376,7 +376,7 @@ void Counters(Json& record, Database& db, const BufferMetrics& before, const IoC
     b.String("peak_pins_scope", "reopened BufferPool lifetime, including metadata preload");
 #define ID(field) f.Number(#field, io.field - io_before.field)
     ID(database_reads); ID(database_writes); ID(database_allocations);
-    ID(temporary_reads); ID(temporary_writes); ID(temporary_allocations); ID(failed_reads); ID(failed_writes);
+    ID(temporary_reads); ID(temporary_writes); ID(temporary_allocations);
 #undef ID
     f.Number("database_write_operations_including_initialization",
         io.database_writes - io_before.database_writes + io.database_allocations - io_before.database_allocations);
@@ -716,7 +716,7 @@ void Run(const Config& c, Json& record, std::string& stage) {
 
 int main(int argc, char** argv) {
     Config c; Json record; std::string stage = "cli";
-    record.Number("schema_version", 3); record.Bool("success", false);
+    record.Number("schema_version", 4); record.Bool("success", false);
     record.String("build_type", VALENCEDB_BENCH_BUILD_TYPE);
     record.String("compiler", VALENCEDB_BENCH_COMPILER);
     record.String("platform", VALENCEDB_BENCH_PLATFORM);

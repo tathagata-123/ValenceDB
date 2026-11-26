@@ -107,7 +107,7 @@ def validate(record):
                 "failure_stage", "failure_reason"}
     if required - record.keys():
         raise ValueError("missing record fields: " + str(required - record.keys()))
-    if record["schema_version"] != 3:
+    if record["schema_version"] != 4:
         raise ValueError("unsupported schema")
     if not record["success"]:
         return
@@ -265,7 +265,7 @@ def main():
                         raise ValueError("exit status disagrees with record")
                 except (subprocess.TimeoutExpired, ValueError, OSError, KeyError, TypeError) as error:
                     failure = str(error)
-                    record = dict(schema_version=3, config=options, success=False,
+                    record = dict(schema_version=4, config=options, success=False,
                                   failure_stage="runner_validation", failure_reason=failure)
                 record.update(suite=args.suite, case_id=case["case_id"], equivalence_group=case["equivalence_group"],
                               command=command, runner_platform=platform.platform(), runner_architecture=platform.machine())

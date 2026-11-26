@@ -86,7 +86,7 @@ Insertion is also separate from read-query timing. An empty heap and empty index
 
 ## Structured schema and metrics
 
-Schema version 3 uses nested JSON objects; 64-bit hash accumulators are hex strings to avoid downstream floating-point loss. All integers represent counts/bytes unless named otherwise. Every successful record has:
+Schema version 4 uses nested JSON objects; 64-bit hash accumulators are hex strings to avoid downstream floating-point loss. All integers represent counts/bytes unless named otherwise. Every successful record has:
 
 | Field | Contents |
 |---|---|
@@ -99,7 +99,7 @@ Schema version 3 uses nested JSON objects; 64-bit hash accumulators are hex stri
 | `result_rows`, `diagnostic_digest`, `ordered_digest` | Consumed row count and explicit stable diagnostic hashes |
 | `reference_validation`, `order_verified`, `finish_query_succeeded` | Applicable validation/lifecycle evidence; page/insert experiments use the documented exceptions |
 | `buffer` | Fetches/hits/misses, evictions/dirty evictions, write causes, CLOCK visits/decrements, ring reuses/fallbacks, pins |
-| `file_io` | Database/temp page reads/writes/allocations/failures, and writes+allocations including initialization |
+| `file_io` | Database/temp successful page reads/writes/allocations, and writes+allocations including initialization |
 | `scratch` | Cumulative allocations, pre-reset extent sum, peak single-query extent, post-reset extent/pins/cache mappings |
 | `success`, `failure_stage`, `failure_reason` | Boolean outcome; failed prefixes are invalid, and missing timings/counters remain unmeasured |
 | Runner fields | Suite/case/equivalence-group identifiers, exact executable argument array, observed platform |
@@ -172,8 +172,8 @@ boundaries; it does not change the per-operator budget or row charges.
 
 ## Phase 4 schema version 3
 
-New records use `schema_version=3`; the runner requires version 3 and validates
-plan budgets and aggregate structure recursively. Existing version 2 evidence is
+Phase 4 introduced `schema_version=3` and recursive validation of plan budgets
+and aggregate structure. Existing version 2 evidence is
 preserved for comparison.
 
 - SortAggregate `children` now contains the actual input, removing the synthetic
@@ -196,6 +196,16 @@ sort into its local cost and replace that child with the sort's input. Compare
 subtree costs, actual algorithms, and execution counters independently; do not
 interpret the removed display node as removal of the sorting work.
 
+
+## V1 Phase 2 schema version 4
+
+New records use `schema_version=4`; the runner requires version 4. The only
+record change from version 3 is removal of `file_io.failed_reads` and
+`file_io.failed_writes`. Errors still fail the operation and appear in
+`success`, `failure_stage`, and `failure_reason`; failed transfers are not
+successful I/O. Successful page-transfer/allocation counts and all buffer,
+scratch, plan, and algorithm fields retain their meanings. Historical records
+are preserved; compare common fields across versions.
 
 ## Standalone V1 B+ tree probe
 

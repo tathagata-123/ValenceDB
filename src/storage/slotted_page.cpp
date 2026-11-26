@@ -1,13 +1,26 @@
 #include "valencedb/storage/slotted_page.hpp"
 #include "valencedb/common/error.hpp"
 
-#include <algorithm>
 #include <cstring>
-#include <utility>
 
 namespace valencedb {
 namespace {
 size_t SlotOffset(uint16_t slot) { return SlottedPage::kHeaderSize + size_t(slot) * 4; }
+
+void CheckBounds(const PageBytes& page) {
+    const size_t count = ReadU16(page, 16);
+    const size_t lower = ReadU16(page, 18);
+    const size_t upper = ReadU16(page, 20);
+    if (count > (kPageSize - SlottedPage::kHeaderSize) / SlottedPage::kSlotSize ||
+        lower != SlottedPage::kHeaderSize + count * SlottedPage::kSlotSize ||
+        lower > upper || upper > kPageSize || ReadU16(page, 22) > count)
+        throw DbError("invalid heap page bounds");
+}
+
+void CheckPayload(const PageBytes& page, size_t offset, size_t length) {
+    if (offset < ReadU16(page, 20) || offset > kPageSize || length > kPageSize - offset)
+        throw DbError("invalid heap slot bounds");
+}
 }
 
 void SlottedPage::Initialize(PageBytes& page, PageId id, PageId owner) {
@@ -24,35 +37,11 @@ void SlottedPage::Initialize(PageBytes& page, PageId id, PageId owner) {
 void SlottedPage::Validate(const PageBytes& page, PageId id, PageId owner) {
     ValidatePageHeader(page, PageType::Heap, id);
     if (ReadU32(page, 28) != owner) throw DbError("heap page owner mismatch");
-    const size_t count = ReadU16(page, 16);
-    const size_t lower = ReadU16(page, 18);
-    const size_t upper = ReadU16(page, 20);
-    const size_t live = ReadU16(page, 22);
-    if (count > (kPageSize - kHeaderSize) / kSlotSize ||
-        lower != kHeaderSize + count * kSlotSize || lower > upper ||
-        upper > kPageSize || live > count)
-        throw DbError("invalid heap page bounds");
-    std::vector<std::pair<size_t, size_t>> ranges;
-    for (size_t i = 0; i < count; ++i) {
-        const size_t offset = ReadU16(page, SlotOffset(static_cast<uint16_t>(i)));
-        const size_t length = ReadU16(page, SlotOffset(static_cast<uint16_t>(i)) + 2);
-        if (length == 0) {
-            if (offset > kPageSize) throw DbError("invalid tombstone offset");
-            continue;
-        }
-        if (offset < upper || offset < lower || offset > kPageSize ||
-            length > kPageSize - offset)
-            throw DbError("invalid heap slot bounds");
-        ranges.emplace_back(offset, offset + length);
-    }
-    if (ranges.size() != live) throw DbError("heap live count mismatch");
-    std::sort(ranges.begin(), ranges.end());
-    for (size_t i = 1; i < ranges.size(); ++i)
-        if (ranges[i].first < ranges[i - 1].second)
-            throw DbError("overlapping heap tuple payloads");
+    CheckBounds(page);
 }
 
 bool SlottedPage::CanFit(const PageBytes& page, size_t tuple_size) {
+    CheckBounds(page);
     const size_t lower = ReadU16(page, 18);
     const size_t upper = ReadU16(page, 20);
     return tuple_size != 0 && tuple_size <= kPageSize &&
@@ -69,7 +58,6 @@ std::optional<uint16_t> SlottedPage::Insert(PageBytes& page, std::span<const std
             return std::nullopt;
         Compact(page);
     }
-    if (!CanFit(page, tuple.size())) return std::nullopt;
     const uint16_t slot = SlotCount(page);
     const uint16_t upper = static_cast<uint16_t>(ReadU16(page, 20) - tuple.size());
     std::memcpy(page.data() + upper, tuple.data(), tuple.size());
@@ -83,29 +71,38 @@ std::optional<uint16_t> SlottedPage::Insert(PageBytes& page, std::span<const std
 }
 
 std::optional<std::vector<std::byte>> SlottedPage::Fetch(const PageBytes& page, uint16_t slot) {
+    CheckBounds(page);
     if (slot >= SlotCount(page)) return std::nullopt;
     const size_t offset = ReadU16(page, SlotOffset(slot));
     const size_t length = ReadU16(page, SlotOffset(slot) + 2);
     if (length == 0) return std::nullopt;
+    CheckPayload(page, offset, length);
     return std::vector<std::byte>(page.begin() + offset, page.begin() + offset + length);
 }
 
 bool SlottedPage::Erase(PageBytes& page, uint16_t slot) {
+    CheckBounds(page);
     if (slot >= SlotCount(page) || ReadU16(page, SlotOffset(slot) + 2) == 0) return false;
+    if (LiveCount(page) == 0) throw DbError("heap live count underflow");
     WriteU16(page, SlotOffset(slot) + 2, 0);
     WriteU16(page, 22, LiveCount(page) - 1);
     return true;
 }
 
 void SlottedPage::Compact(PageBytes& page) {
+    CheckBounds(page);
     PageBytes scratch{};
     uint16_t upper = kPageSize;
+    const uint16_t lower = ReadU16(page, 18);
     for (uint16_t i = 0; i < SlotCount(page); ++i) {
         const size_t slot = SlotOffset(i);
         const uint16_t length = ReadU16(page, slot + 2);
         if (length == 0) continue;
+        const uint16_t offset = ReadU16(page, slot);
+        CheckPayload(page, offset, length);
+        if (length > upper - lower) throw DbError("heap payloads exceed page capacity");
         upper -= length;
-        std::memcpy(scratch.data() + upper, page.data() + ReadU16(page, slot), length);
+        std::memcpy(scratch.data() + upper, page.data() + offset, length);
         WriteU16(page, slot, upper);
     }
     std::memcpy(page.data() + upper, scratch.data() + upper, kPageSize - upper);

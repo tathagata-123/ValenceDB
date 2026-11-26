@@ -8,7 +8,6 @@ namespace valencedb {
 namespace {
 PageGuard FetchHeap(BufferPool& pool, PageId id, PageId owner, AccessMode mode,
                     ScanRing* ring = nullptr) {
-    if (id == kInvalidPageId) throw DbError("invalid heap page ID");
     auto guard = pool.Fetch({FileKind::Database, id}, mode, ring);
     SlottedPage::Validate(guard.Data(), id, owner);
     return guard;
@@ -71,10 +70,9 @@ std::optional<Tuple> HeapFile::Fetch(RID rid) const {
 bool HeapFile::Erase(RID rid) {
     if (rid.page_id == kInvalidPageId) return false;
     auto page = FetchHeap(pool_, rid.page_id, table_.meta_page, AccessMode::Normal);
-    if (!SlottedPage::Fetch(page.Data(), rid.slot_id)) return false;
-    if (table_.live_rows == 0) throw DbError("table row count underflow");
-    SlottedPage::Erase(page.MutableData(), rid.slot_id);
+    if (!SlottedPage::Erase(page.MutableData(), rid.slot_id)) return false;
     page.MarkDirty();
+    if (table_.live_rows == 0) throw DbError("table row count underflow");
     --table_.live_rows;
     return true;
 }

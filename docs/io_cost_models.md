@@ -31,7 +31,7 @@ Dirty eviction counts completed replacements; dirty-eviction writes count transf
 
 ## File layer and allocation
 
-`database_reads` / `temporary_reads` count completed 4096-byte Read calls. `database_writes` / `temporary_writes` count completed 4096-byte Write calls. `failed_reads` / `failed_writes` count rejected/failed calls, including invalid page IDs and the one-shot test hook; they are not completed transfers. Flush/close/reset and allocation failures are checked errors, not read/write-counter events.
+`database_reads` / `temporary_reads` count completed 4096-byte Read calls. `database_writes` / `temporary_writes` count completed 4096-byte Write calls. Failed operations throw and are not counted as completed transfers. V1 Phase 2 removes the failure-only counters; flush/close/reset and allocation failures also propagate as errors.
 
 `database_allocations` / `temporary_allocations` count successful append-and-zero-initialize operations. Initialization writes one full page and flushes the stream, but is counted in allocations **instead of** ordinary writes. Therefore the file layer's successful full-page write operations, including initialization, are `writes + allocations` for each file. This is not an fsync or device-write count. Failed or partial physical transfers are not claimed as successful operations.
 

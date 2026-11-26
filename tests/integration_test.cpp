@@ -375,7 +375,6 @@ void MetricLayers() {
     const auto io = disk.counters();
     VDB_CHECK(m.buffer_fetches == 4 && m.buffer_hits == 1 && m.buffer_misses == 3);
     VDB_CHECK(io.database_reads == 2 && io.temporary_reads == 0);
-    VDB_CHECK(io.failed_reads == 1 && io.failed_writes == 2);
     VDB_CHECK(io.database_writes + io.temporary_writes == m.explicit_flush_writes + m.dirty_eviction_writes);
     VDB_CHECK(m.active_pins == 0 && m.peak_pins == 1);
     disk.Close();

@@ -1,4 +1,5 @@
 #include "test_harness.h"
+#include "slotted_page_validator.hpp"
 #include "valencedb/common/error.hpp"
 #include "valencedb/storage/database.hpp"
 #include "valencedb/storage/slotted_page.hpp"
@@ -54,7 +55,7 @@ void CheckRow(const Tuple& row, int64_t id, const std::string& tag) {
 void SlottedLayoutAndBounds() {
     PageBytes page{};
     SlottedPage::Initialize(page, 7, 5);
-    SlottedPage::Validate(page, 7, 5);
+    test::ValidateSlottedPage(page, 7, 5);
     VDB_CHECK(ReadU16(page, 16) == 0);
     VDB_CHECK(ReadU16(page, 18) == 32);
     VDB_CHECK(ReadU16(page, 20) == 4096);
@@ -76,13 +77,13 @@ void SlottedLayoutAndBounds() {
     VDB_CHECK(!SlottedPage::Fetch(page, 400));
     VDB_CHECK(SlottedPage::Insert(page, EncodeTuple(schema, Row(4, "D"))) == 3);
     SlottedPage::Compact(page);
-    SlottedPage::Validate(page, 7, 5);
+    test::ValidateSlottedPage(page, 7, 5);
     CheckRow(DecodeTuple(schema, *SlottedPage::Fetch(page, 2)), 2, std::string(256, 'z'));
     VDB_CHECK(SlottedPage::Erase(page, 0));
     VDB_CHECK(SlottedPage::Erase(page, 2));
     VDB_CHECK(SlottedPage::Erase(page, 3));
     VDB_CHECK(SlottedPage::LiveCount(page) == 0);
-    SlottedPage::Validate(page, 7, 5);
+    test::ValidateSlottedPage(page, 7, 5);
     Throws([&] { SlottedPage::Validate(page, 7, 6); });
 
     PageBytes exact{};
@@ -94,7 +95,7 @@ void SlottedLayoutAndBounds() {
     PageBytes over{};
     SlottedPage::Initialize(over, 9, 5);
     VDB_CHECK(!SlottedPage::Insert(over, std::vector<std::byte>(fill.size() + 1)));
-    SlottedPage::Validate(over, 9, 5);
+    test::ValidateSlottedPage(over, 9, 5);
     VDB_CHECK(SlottedPage::SlotCount(over) == 0);
 }
 
@@ -111,12 +112,73 @@ void CorruptPages() {
     bad = good; WriteU16(bad, 20, 5000);
     Throws([&] { SlottedPage::Validate(bad, 3, 2); });
     bad = good; WriteU16(bad, 32, 20);
-    Throws([&] { SlottedPage::Validate(bad, 3, 2); });
+    SlottedPage::Validate(bad, 3, 2); // Unused slots are no longer scanned here.
+    Throws([&] { SlottedPage::Fetch(bad, 0); });
+    Throws([&] { SlottedPage::Compact(bad); });
+    Throws([&] { test::ValidateSlottedPage(bad, 3, 2); });
     bad = good; WriteU16(bad, 34, 20);
-    Throws([&] { SlottedPage::Validate(bad, 3, 2); });
+    Throws([&] { SlottedPage::Fetch(bad, 0); });
+    Throws([&] { SlottedPage::Compact(bad); });
+    Throws([&] { test::ValidateSlottedPage(bad, 3, 2); });
     bad = good; WriteU16(bad, ReadU16(bad, 32), 2);
     SlottedPage::Validate(bad, 3, 2);
     Throws([&] { DecodeTuple(Schema1(), *SlottedPage::Fetch(bad, 0)); });
+
+    // Bounds are checked even for direct accesses without a prior Validate.
+    for (const uint16_t offset : {uint16_t{4096}, uint16_t{65535}}) {
+        bad = good; WriteU16(bad, 32, offset);
+        Throws([&] { SlottedPage::Fetch(bad, 0); });
+        Throws([&] { SlottedPage::Compact(bad); });
+    }
+    bad = good; WriteU16(bad, 16, UINT16_MAX);
+    Throws([&] { SlottedPage::Fetch(bad, 0); });
+    Throws([&] { SlottedPage::Insert(bad, bytes); });
+    Throws([&] { SlottedPage::Erase(bad, 0); });
+    Throws([&] { SlottedPage::Compact(bad); });
+    bad = good; WriteU16(bad, 22, 0);
+    SlottedPage::Validate(bad, 3, 2);
+    Throws([&] { test::ValidateSlottedPage(bad, 3, 2); });
+    Throws([&] { SlottedPage::Erase(bad, 0); });
+
+    VDB_CHECK(SlottedPage::Insert(good, bytes) == 1);
+    bad = good; WriteU16(bad, 36, ReadU16(bad, 32));
+    SlottedPage::Validate(bad, 3, 2);
+    Throws([&] { test::ValidateSlottedPage(bad, 3, 2); });
+
+    // Both source ranges fit individually, but their sum cannot fit the page.
+    WriteU16(bad, 20, 40);
+    for (const size_t slot : {size_t{32}, size_t{36}}) {
+        WriteU16(bad, slot, 40);
+        WriteU16(bad, slot + 2, 3000);
+    }
+    Throws([&] { SlottedPage::Compact(bad); });
+}
+
+void RandomizedSlottedPages() {
+    for (const unsigned seed : {17u, 930u, 2026u}) {
+        PageBytes page{};
+        SlottedPage::Initialize(page, 3, 2);
+        std::mt19937 rng(seed);
+        std::vector<std::optional<std::vector<std::byte>>> rows;
+        for (size_t step = 0; step < 600; ++step) {
+            if (rows.empty() || rng() % 3 == 0) {
+                std::vector<std::byte> bytes(1 + rng() % 300, std::byte(rng() % 256));
+                if (auto slot = SlottedPage::Insert(page, bytes)) {
+                    VDB_CHECK(*slot == rows.size());
+                    rows.push_back(bytes);
+                }
+            } else if (rng() % 2 == 0) {
+                const auto slot = static_cast<uint16_t>(rng() % rows.size());
+                VDB_CHECK(SlottedPage::Erase(page, slot) == rows[slot].has_value());
+                rows[slot].reset();
+            } else {
+                SlottedPage::Compact(page);
+            }
+            test::ValidateSlottedPage(page, 3, 2);
+            for (size_t slot = 0; slot < rows.size(); ++slot)
+                VDB_CHECK(SlottedPage::Fetch(page, static_cast<uint16_t>(slot)) == rows[slot]);
+        }
+    }
 }
 
 void DatabaseRoundTrip() {
@@ -147,7 +209,7 @@ void DatabaseRoundTrip() {
             uint32_t pages = 0;
             while (page_id != kInvalidPageId) {
                 auto page = db.Buffer().Fetch({FileKind::Database, page_id});
-                SlottedPage::Validate(page.Data(), page_id, info.meta_page);
+                test::ValidateSlottedPage(page.Data(), page_id, info.meta_page);
                 const PageId next = SlottedPage::Next(page.Data());
                 ++pages;
                 if (next == kInvalidPageId) VDB_CHECK(page_id == info.last_page);
@@ -177,6 +239,7 @@ void DatabaseRoundTrip() {
         auto foreign = db.Insert("empty", Tuple({Value(int64_t{1000})}));
         Throws([&] { (void)db.Fetch("rows", foreign); });
         Throws([&] { (void)db.Delete("rows", foreign); });
+        Throws([&] { (void)db.Delete("rows", {foreign.page_id, UINT16_MAX}); });
         VDB_CHECK(db.Fetch("empty", foreign).has_value());
         Throws([&] { (void)scan.Next(); });
         VDB_CHECK(db.Metrics().active_pins == 0);
@@ -234,7 +297,7 @@ void CompactionAndDirectoryExhaustion() {
     VDB_CHECK(SlottedPage::Erase(page, 1));
     VDB_CHECK(!SlottedPage::CanFit(page, 500));
     VDB_CHECK(SlottedPage::Insert(page, std::vector<std::byte>(500)) == 4);
-    SlottedPage::Validate(page, 4, 2);
+    test::ValidateSlottedPage(page, 4, 2);
     VDB_CHECK(!SlottedPage::Fetch(page, 1));
     VDB_CHECK(SlottedPage::Fetch(page, 2)->size() == 1000);
     PageBytes tiny{};
@@ -246,7 +309,7 @@ void CompactionAndDirectoryExhaustion() {
         VDB_CHECK(SlottedPage::Erase(tiny, *slot));
     }
     VDB_CHECK(count == (4096 - 32) / 4 - 1);
-    SlottedPage::Validate(tiny, 5, 2);
+    test::ValidateSlottedPage(tiny, 5, 2);
     VDB_CHECK(!SlottedPage::Insert(tiny, one));
 }
 
@@ -332,6 +395,7 @@ int main() {
     try {
         SlottedLayoutAndBounds();
         CorruptPages();
+        RandomizedSlottedPages();
         CompactionAndDirectoryExhaustion();
         HeapDirectoryExhaustion();
         DatabaseRoundTrip();

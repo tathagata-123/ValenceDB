@@ -470,10 +470,8 @@ void IoErrorsPropagate() {
     Insert(db, tree, oracle, {-1, {0, 0}});
     // Leave a dirty leaf in the only frame, then fail its eviction on insertion.
     Insert(db, tree, oracle, {4, {0, 0}});
-    const auto failed = db.Disk().counters().failed_writes;
     db.Disk().FailNextIo(FailNext::Write);
     Throws([&] { tree.Insert(5, {0, 0}); });
-    VDB_CHECK(db.Disk().counters().failed_writes == failed + 1);
     NoPins(db);
     // Abandon this tree: no rollback, unchanged contents, or retry is promised.
     db.Close();

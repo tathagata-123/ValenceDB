@@ -14,6 +14,8 @@ public:
     static constexpr uint16_t kSlotSize = 4;
 
     static void Initialize(PageBytes& page, PageId id, PageId owner);
+    // Constant-time identity/owner/header checks; payload bounds are checked on access.
+    // Full overlap and live-count audits belong in the test validator.
     static void Validate(const PageBytes& page, PageId id, PageId owner);
     static bool CanFit(const PageBytes& page, size_t tuple_size);
     static std::optional<uint16_t> Insert(PageBytes& page, std::span<const std::byte> tuple);

@@ -15,47 +15,34 @@ std::string PathMessage(const std::filesystem::path& path, const char* action) {
 
 DiskManager::DiskManager(std::filesystem::path database_path, OpenMode database_mode,
                          std::filesystem::path temporary_path, OpenMode temporary_mode) {
-    try {
-        if (database_path == temporary_path ||
-            (std::filesystem::exists(database_path) && std::filesystem::exists(temporary_path) &&
-             std::filesystem::equivalent(database_path, temporary_path)))
-            throw DbError("database and temporary files must be distinct");
-    } catch (const std::filesystem::filesystem_error& error) {
-        throw DbError(std::string("page file path error: ") + error.what());
-    }
+    if (database_path == temporary_path ||
+        (std::filesystem::exists(database_path) && std::filesystem::exists(temporary_path) &&
+         std::filesystem::equivalent(database_path, temporary_path)))
+        throw DbError("database and temporary files must be distinct");
     database_.path = std::move(database_path);
     temporary_.path = std::move(temporary_path);
     OpenFile(database_, database_mode);
     OpenFile(temporary_, temporary_mode);
 }
 
-DiskManager::~DiskManager() noexcept {
-    if (database_.stream.is_open()) database_.stream.close();
-    if (temporary_.stream.is_open()) temporary_.stream.close();
-}
-
 void DiskManager::OpenFile(File& file, OpenMode mode) {
-    try {
-        if (mode == OpenMode::CreateNew) {
-            if (std::filesystem::exists(file.path))
-                throw DbError(PathMessage(file.path, "file already exists"));
-            std::ofstream create(file.path, std::ios::binary | std::ios::trunc);
-            if (!create) throw DbError(PathMessage(file.path, "cannot create file"));
-            create.close();
-            if (!create) throw DbError(PathMessage(file.path, "cannot close new file"));
-        } else if (mode != OpenMode::OpenExisting || !std::filesystem::is_regular_file(file.path)) {
-            throw DbError(PathMessage(file.path, "page file does not exist"));
-        }
-        const uintmax_t length = std::filesystem::file_size(file.path);
-        if (length % kPageSize != 0 || length / kPageSize > kInvalidPageId ||
-            length > uintmax_t(std::numeric_limits<std::streamoff>::max()))
-            throw DbError(PathMessage(file.path, "invalid page file length"));
-        file.page_count = static_cast<uint32_t>(length / kPageSize);
-        file.stream.open(file.path, std::ios::binary | std::ios::in | std::ios::out);
-        if (!file.stream) throw DbError(PathMessage(file.path, "cannot open page file"));
-    } catch (const std::filesystem::filesystem_error& error) {
-        throw DbError(std::string("page file error: ") + error.what());
+    if (mode == OpenMode::CreateNew) {
+        if (std::filesystem::exists(file.path))
+            throw DbError(PathMessage(file.path, "file already exists"));
+        std::ofstream create(file.path, std::ios::binary | std::ios::trunc);
+        if (!create) throw DbError(PathMessage(file.path, "cannot create file"));
+        create.close();
+        if (!create) throw DbError(PathMessage(file.path, "cannot close new file"));
+    } else if (mode != OpenMode::OpenExisting || !std::filesystem::is_regular_file(file.path)) {
+        throw DbError(PathMessage(file.path, "page file does not exist"));
     }
+    const uintmax_t length = std::filesystem::file_size(file.path);
+    if (length % kPageSize != 0 || length / kPageSize > kInvalidPageId ||
+        length > uintmax_t(std::numeric_limits<std::streamoff>::max()))
+        throw DbError(PathMessage(file.path, "invalid page file length"));
+    file.page_count = static_cast<uint32_t>(length / kPageSize);
+    file.stream.open(file.path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!file.stream) throw DbError(PathMessage(file.path, "cannot open page file"));
 }
 
 DiskManager::File& DiskManager::Select(FileKind kind) {
@@ -111,48 +98,36 @@ PageId DiskManager::Allocate(FileKind kind) {
 }
 
 void DiskManager::Read(PageRef page, PageBytes& out) {
-    try {
-        CheckPage(page);
-        if (fail_next_ == FailNext::Read) {
-            fail_next_ = FailNext::None;
-            throw DbError("injected page read failure");
-        }
-        File& file = Select(page.file);
-        file.stream.clear();
-        file.stream.seekg(Offset(page.page_id));
-        if (!file.stream) throw DbError(PathMessage(file.path, "page read seek failed"));
-        PageBytes staging{};
-        file.stream.read(reinterpret_cast<char*>(staging.data()), staging.size());
-        if (file.stream.gcount() != static_cast<std::streamsize>(kPageSize) || !file.stream)
-            throw DbError(PathMessage(file.path, "short page read"));
-        out = staging;
-        if (page.file == FileKind::Database) ++counters_.database_reads;
-        else ++counters_.temporary_reads;
-    } catch (const DbError&) {
-        ++counters_.failed_reads;
-        throw;
+    CheckPage(page);
+    if (fail_next_ == FailNext::Read) {
+        fail_next_ = FailNext::None;
+        throw DbError("injected page read failure");
     }
+    File& file = Select(page.file);
+    file.stream.clear();
+    file.stream.seekg(Offset(page.page_id));
+    if (!file.stream) throw DbError(PathMessage(file.path, "page read seek failed"));
+    file.stream.read(reinterpret_cast<char*>(out.data()), out.size());
+    if (file.stream.gcount() != static_cast<std::streamsize>(kPageSize) || !file.stream)
+        throw DbError(PathMessage(file.path, "short page read"));
+    if (page.file == FileKind::Database) ++counters_.database_reads;
+    else ++counters_.temporary_reads;
 }
 
 void DiskManager::Write(PageRef page, const PageBytes& data) {
-    try {
-        CheckPage(page);
-        if (fail_next_ == FailNext::Write) {
-            fail_next_ = FailNext::None;
-            throw DbError("injected page write failure");
-        }
-        File& file = Select(page.file);
-        file.stream.clear();
-        file.stream.seekp(Offset(page.page_id));
-        if (!file.stream) throw DbError(PathMessage(file.path, "page write seek failed"));
-        file.stream.write(reinterpret_cast<const char*>(data.data()), data.size());
-        if (!file.stream) throw DbError(PathMessage(file.path, "page write failed"));
-        if (page.file == FileKind::Database) ++counters_.database_writes;
-        else ++counters_.temporary_writes;
-    } catch (const DbError&) {
-        ++counters_.failed_writes;
-        throw;
+    CheckPage(page);
+    if (fail_next_ == FailNext::Write) {
+        fail_next_ = FailNext::None;
+        throw DbError("injected page write failure");
     }
+    File& file = Select(page.file);
+    file.stream.clear();
+    file.stream.seekp(Offset(page.page_id));
+    if (!file.stream) throw DbError(PathMessage(file.path, "page write seek failed"));
+    file.stream.write(reinterpret_cast<const char*>(data.data()), data.size());
+    if (!file.stream) throw DbError(PathMessage(file.path, "page write failed"));
+    if (page.file == FileKind::Database) ++counters_.database_writes;
+    else ++counters_.temporary_writes;
 }
 
 void DiskManager::Flush(FileKind kind) {
@@ -186,11 +161,7 @@ void DiskManager::ResetTemporary() {
     Flush(FileKind::Temporary);
     file.stream.close();
     if (file.stream.fail()) throw DbError("temporary file close before reset failed");
-    try {
-        std::filesystem::resize_file(file.path, 0);
-    } catch (const std::filesystem::filesystem_error& error) {
-        throw DbError(std::string("temporary file reset failed: ") + error.what());
-    }
+    std::filesystem::resize_file(file.path, 0);
     OpenFile(file, OpenMode::OpenExisting);
 }
 

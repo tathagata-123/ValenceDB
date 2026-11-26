@@ -679,10 +679,8 @@ void TempInputsAndFailure() {
         join.Init(); Tuple row({}); VDB_CHECK(join.Next(row));
         for (const auto& frame : db.Buffer().InspectFrames())
             if (frame.page && frame.page->file == FileKind::Temporary) db.Buffer().Invalidate(*frame.page);
-        const auto failures = db.Disk().counters().failed_reads;
         db.Disk().FailNextIo(FailNext::Read);
         Throws([&] { while (join.Next(row)) {} });
-        VDB_CHECK(db.Disk().counters().failed_reads == failures + 1);
         VDB_CHECK(!join.Exhausted());
         Throws([&] { q.FinishQuery(join); }, "EOF");
         join.Close(); join.Close(); Pins(db);
